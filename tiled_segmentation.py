@@ -9,6 +9,45 @@ from importlib.metadata import version as _getv
 import pkg_resources
 
 
+def apply_gamma_transform(image, gamma=1.0):
+    """
+    Apply gamma transformation to an image.
+    
+    The image is normalized to [0, 1], gamma is applied, then scaled back
+    to original range.
+    
+    Parameters:
+    -----------
+    image : numpy.ndarray
+        Input image (any shape)
+    gamma : float
+        Gamma value. gamma < 1 brightens, gamma > 1 darkens. Default is 1.0 (no change)
+        
+    Returns:
+    --------
+    transformed_image : numpy.ndarray
+        Gamma-transformed image in original range
+    """
+    if gamma == 1.0:
+        return image
+    
+    # Store original range
+    original_min = np.min(image)
+    original_max = np.max(image)
+    original_dtype = image.dtype
+    
+    # Normalize to [0, 1]
+    image_normalized = (image - original_min) / (original_max - original_min)
+    
+    # Apply gamma transformation
+    image_gamma = np.power(image_normalized, gamma)
+    
+    # Scale back to original range
+    image_transformed = image_gamma * (original_max - original_min) + original_min
+    
+    return image_transformed.astype(original_dtype)
+
+
 def tile_image_3d(image, tile_size=(256, 256, 256), overlap_xy=32):
     """
     Tile a 3D image into overlapping tiles.
@@ -305,7 +344,7 @@ def segment_large_image(image, model, tile_size=(256, 256, 256), overlap_xy=32,
 
 def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256), 
                      overlap_xy=32, cellpose_config_dict=None, normalize=True,
-                     verbose=True):
+                     gamma=1.0, verbose=True):
     """
     Segment a timelapse video (4D: time, z, y, x) using tiled segmentation.
     
@@ -325,6 +364,9 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
         Dictionary of cellpose configuration parameters
     normalize : bool
         Whether to normalize the video to range 0-1. Default is True
+    gamma : float
+        Gamma value for gamma transformation applied per frame before segmentation.
+        gamma < 1 brightens, gamma > 1 darkens. Default is 1.0 (no change)
     verbose : bool
         Print progress information
         
@@ -371,6 +413,17 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
         video = video.astype(np.float32)
         video = (video - np.min(video)) / (np.max(video) - np.min(video))
     
+    # Apply gamma transformation if requested
+    if gamma != 1.0:
+        if verbose:
+            print(f"Applying gamma transformation (gamma={gamma})...")
+        # Apply gamma frame by frame
+        for t in range(n_timepoints):
+            video[t] = apply_gamma_transform(video[t], gamma=gamma)
+    
+    # Create filename suffix with gamma parameter
+    gamma_suffix = f"_gamma{gamma:.2f}" if gamma != 1.0 else ""
+    
     # Initialize output array
     all_masks = []
     
@@ -398,7 +451,7 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
         all_masks.append(masks)
         
         # Save individual timepoint mask
-        timepoint_prefix = output_dir / f"T{t:04d}"
+        timepoint_prefix = output_dir / f"T{t:04d}{gamma_suffix}"
         if verbose:
             print(f"Saving timepoint {t} mask...")
         
@@ -413,7 +466,7 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
         print("Saving complete video results...")
         print(f"{'='*60}")
     
-    video_output_prefix = output_dir / "video_complete"
+    video_output_prefix = output_dir / f"video_complete{gamma_suffix}"
     tiff.imwrite(str(video_output_prefix) + "_masks.tif", all_masks.astype(np.uint16))
     
     if verbose:
@@ -442,47 +495,21 @@ if __name__ == "__main__":
     pretrained_model_path = r'/Users/ewheeler/.cellpose/models/CP_20250430_181517'
     model = CellposeModel(gpu=True, pretrained_model=pretrained_model_path)
     
-    # Choose which example to run:
-    use_timelapse = False  # Set to True to process a timelapse video
     
-    if use_timelapse:
-        # Example: Process timelapse video
-        video_path = r"/Users/ewheeler/cellpose3_testing/data/timelapse_video.tif"
-        output_dir = r"/Users/ewheeler/cellpose3_testing/data/timelapse_results"
-        
-        all_masks = segment_timelapse(
-            video_path=video_path,
-            output_dir=output_dir,
-            model=model,
-            tile_size=(256, 128, 128),
-            overlap_xy=32,
-            verbose=True
-        )
-        
-        print(f"\nFinal output shape: {all_masks.shape}")
-        
-    else:
-        # Example: Process single timepoint
-        img_path = r"/Users/ewheeler/cellpose3_testing/data/T0_32bit_xy.tif"
-        output_path = r"/Users/ewheeler/cellpose3_testing/data/T0_32bit_xy_tiled_segmented.tif"
-        
-        vid = tiff.imread(img_path)
-        print('Video shape:', vid.shape)
-        
-        # Normalize the video to range 0-1
-        vid = vid.astype(np.float32)
-        vid = (vid - np.min(vid)) / (np.max(vid) - np.min(vid))
-        
-        # Segment with tiling
-        # Adjust tile_size and overlap_xy as needed
-        dP_blur, cell_prob_blur, masks = segment_large_image(
-            vid, 
-            model,
-            tile_size=(256, 128, 128),
-            overlap_xy=32,  # Tunable overlap parameter
-            verbose=True
-        )
-        
-        # Save results
-        print(f"Saving masks to {output_path}")
-        tiff.imwrite(output_path, masks.astype(np.uint16))
+
+    # Example: Process timelapse video with gamma transformation
+    video_path = r"/Users/ewheeler/cellpose3_testing/data/timelapse_video.tif"
+    output_dir = r"/Users/ewheeler/cellpose3_testing/data/timelapse_results"
+    
+    all_masks = segment_timelapse(
+        video_path=video_path,
+        output_dir=output_dir,
+        model=model,
+        tile_size=(256, 128, 128),
+        overlap_xy=32,
+        gamma=0.8,  # Apply gamma correction (< 1 brightens, > 1 darkens, 1.0 = no change)
+        verbose=True
+    )
+    
+    print(f"\nFinal output shape: {all_masks.shape}")
+    
