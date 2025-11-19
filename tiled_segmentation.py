@@ -303,6 +303,126 @@ def segment_large_image(image, model, tile_size=(256, 256, 256), overlap_xy=32,
     return dP_blur, cell_prob_blur, masks
 
 
+def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256), 
+                     overlap_xy=32, cellpose_config_dict=None, normalize=True,
+                     verbose=True):
+    """
+    Segment a timelapse video (4D: time, z, y, x) using tiled segmentation.
+    
+    Parameters:
+    -----------
+    video_path : str
+        Path to the input video file
+    output_dir : str
+        Directory to save output files
+    model : CellposeModel
+        Cellpose model to use for segmentation
+    tile_size : tuple
+        Size of each tile (z, y, x). Default is (256, 256, 256)
+    overlap_xy : int
+        Overlap in pixels for XY dimensions. Default is 32
+    cellpose_config_dict : dict
+        Dictionary of cellpose configuration parameters
+    normalize : bool
+        Whether to normalize the video to range 0-1. Default is True
+    verbose : bool
+        Print progress information
+        
+    Returns:
+    --------
+    all_masks : numpy.ndarray
+        Segmentation masks for all timepoints with shape (t, z, y, x)
+    """
+    import os
+    from pathlib import Path
+    
+    # Create output directory if it doesn't exist
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load video
+    if verbose:
+        print(f"Loading video from {video_path}")
+    video = tiff.imread(video_path)
+    
+    if verbose:
+        print(f"Video shape: {video.shape}")
+    
+    # Determine if video is 4D (timelapse) or 3D (single timepoint)
+    if video.ndim == 3:
+        # Single timepoint, add time dimension
+        video = video[np.newaxis, ...]
+        is_timelapse = False
+        if verbose:
+            print("Single timepoint detected, processing as single frame")
+    elif video.ndim == 4:
+        is_timelapse = True
+        if verbose:
+            print(f"Timelapse detected with {video.shape[0]} timepoints")
+    else:
+        raise ValueError(f"Expected 3D or 4D video, got shape {video.shape}")
+    
+    n_timepoints = video.shape[0]
+    
+    # Normalize if requested
+    if normalize:
+        if verbose:
+            print("Normalizing video to range 0-1...")
+        video = video.astype(np.float32)
+        video = (video - np.min(video)) / (np.max(video) - np.min(video))
+    
+    # Initialize output array
+    all_masks = []
+    
+    # Process each timepoint
+    for t in range(n_timepoints):
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Processing timepoint {t+1}/{n_timepoints}")
+            print(f"{'='*60}")
+        
+        # Extract current timepoint
+        frame = video[t]
+        
+        # Segment the frame
+        dP_blur, cell_prob_blur, masks = segment_large_image(
+            frame,
+            model,
+            tile_size=tile_size,
+            overlap_xy=overlap_xy,
+            cellpose_config_dict=cellpose_config_dict,
+            verbose=verbose
+        )
+        
+        # Store results
+        all_masks.append(masks)
+        
+        # Save individual timepoint mask
+        timepoint_prefix = output_dir / f"T{t:04d}"
+        if verbose:
+            print(f"Saving timepoint {t} mask...")
+        
+        tiff.imwrite(str(timepoint_prefix) + "_masks.tif", masks.astype(np.uint16))
+    
+    # Convert to numpy array
+    all_masks = np.array(all_masks)
+    
+    # Save complete video results
+    if verbose:
+        print(f"\n{'='*60}")
+        print("Saving complete video results...")
+        print(f"{'='*60}")
+    
+    video_output_prefix = output_dir / "video_complete"
+    tiff.imwrite(str(video_output_prefix) + "_masks.tif", all_masks.astype(np.uint16))
+    
+    if verbose:
+        print(f"\nAll results saved to {output_dir}")
+        print(f"Total timepoints processed: {n_timepoints}")
+    
+    return all_masks
+
+
 if __name__ == "__main__":
     try:
         version = getattr(cellpose, '__version__', None)
@@ -322,26 +442,47 @@ if __name__ == "__main__":
     pretrained_model_path = r'/Users/ewheeler/.cellpose/models/CP_20250430_181517'
     model = CellposeModel(gpu=True, pretrained_model=pretrained_model_path)
     
-    img_path = r"/Users/ewheeler/cellpose3_testing/data/T0_32bit_xy.tif"
-    output_path = r"/Users/ewheeler/cellpose3_testing/data/T0_32bit_xy_tiled_segmented.tif"
+    # Choose which example to run:
+    use_timelapse = False  # Set to True to process a timelapse video
     
-    vid = tiff.imread(img_path)
-    print('Video shape:', vid.shape)
-    
-    # Normalize the video to range 0-1
-    vid = vid.astype(np.float32)
-    vid = (vid - np.min(vid)) / (np.max(vid) - np.min(vid))
-    
-    # Segment with tiling
-    # Adjust tile_size and overlap_xy as needed
-    dP_blur, cell_prob_blur, masks = segment_large_image(
-        vid, 
-        model,
-        tile_size=(256, 128, 128),
-        overlap_xy=32,  # Tunable overlap parameter
-        verbose=True
-    )
-    
-    # Save results
-    print(f"Saving masks to {output_path}")
-    tiff.imwrite(output_path, masks.astype(np.uint16))
+    if use_timelapse:
+        # Example: Process timelapse video
+        video_path = r"/Users/ewheeler/cellpose3_testing/data/timelapse_video.tif"
+        output_dir = r"/Users/ewheeler/cellpose3_testing/data/timelapse_results"
+        
+        all_masks = segment_timelapse(
+            video_path=video_path,
+            output_dir=output_dir,
+            model=model,
+            tile_size=(256, 128, 128),
+            overlap_xy=32,
+            verbose=True
+        )
+        
+        print(f"\nFinal output shape: {all_masks.shape}")
+        
+    else:
+        # Example: Process single timepoint
+        img_path = r"/Users/ewheeler/cellpose3_testing/data/T0_32bit_xy.tif"
+        output_path = r"/Users/ewheeler/cellpose3_testing/data/T0_32bit_xy_tiled_segmented.tif"
+        
+        vid = tiff.imread(img_path)
+        print('Video shape:', vid.shape)
+        
+        # Normalize the video to range 0-1
+        vid = vid.astype(np.float32)
+        vid = (vid - np.min(vid)) / (np.max(vid) - np.min(vid))
+        
+        # Segment with tiling
+        # Adjust tile_size and overlap_xy as needed
+        dP_blur, cell_prob_blur, masks = segment_large_image(
+            vid, 
+            model,
+            tile_size=(256, 128, 128),
+            overlap_xy=32,  # Tunable overlap parameter
+            verbose=True
+        )
+        
+        # Save results
+        print(f"Saving masks to {output_path}")
+        tiff.imwrite(output_path, masks.astype(np.uint16))
