@@ -344,7 +344,7 @@ def segment_large_image(image, model, tile_size=(256, 256, 256), overlap_xy=32,
 
 def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256), 
                      overlap_xy=32, cellpose_config_dict=None, normalize=True,
-                     gamma=1.0, verbose=True):
+                     gamma=1.0, t_range=None, verbose=True):
     """
     Segment a timelapse video (4D: time, z, y, x) using tiled segmentation.
     
@@ -367,13 +367,18 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
     gamma : float
         Gamma value for gamma transformation applied per frame before segmentation.
         gamma < 1 brightens, gamma > 1 darkens. Default is 1.0 (no change)
+    t_range : tuple, list, or None
+        Time range to process. Can be:
+        - None: process all timepoints (default)
+        - tuple (start, end): process timepoints from start to end (exclusive)
+        - list: process specific timepoint indices [0, 2, 5, 10]
     verbose : bool
         Print progress information
         
     Returns:
     --------
     all_masks : numpy.ndarray
-        Segmentation masks for all timepoints with shape (t, z, y, x)
+        Segmentation masks for selected timepoints with shape (t, z, y, x)
     """
     import os
     from pathlib import Path
@@ -406,6 +411,28 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
     
     n_timepoints = video.shape[0]
     
+    # Determine which timepoints to process
+    if t_range is None:
+        # Process all timepoints
+        timepoints_to_process = list(range(n_timepoints))
+    elif isinstance(t_range, (list, np.ndarray)):
+        # Process specific timepoints from list
+        timepoints_to_process = list(t_range)
+        # Validate indices
+        if any(t < 0 or t >= n_timepoints for t in timepoints_to_process):
+            raise ValueError(f"t_range contains invalid timepoint indices. Valid range: 0-{n_timepoints-1}")
+    elif isinstance(t_range, tuple) and len(t_range) == 2:
+        # Process range of timepoints
+        start, end = t_range
+        if start < 0 or end > n_timepoints:
+            raise ValueError(f"t_range ({start}, {end}) out of bounds. Valid range: 0-{n_timepoints}")
+        timepoints_to_process = list(range(start, end))
+    else:
+        raise ValueError("t_range must be None, a list of indices, or a tuple (start, end)")
+    
+    if verbose:
+        print(f"Processing {len(timepoints_to_process)} timepoint(s): {timepoints_to_process}")
+    
     # Normalize if requested
     if normalize:
         if verbose:
@@ -417,8 +444,8 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
     if gamma != 1.0:
         if verbose:
             print(f"Applying gamma transformation (gamma={gamma})...")
-        # Apply gamma frame by frame
-        for t in range(n_timepoints):
+        # Apply gamma frame by frame (only to timepoints we're processing)
+        for t in timepoints_to_process:
             video[t] = apply_gamma_transform(video[t], gamma=gamma)
     
     # Create filename suffix with gamma parameter
@@ -428,10 +455,10 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
     all_masks = []
     
     # Process each timepoint
-    for t in range(n_timepoints):
+    for idx, t in enumerate(timepoints_to_process):
         if verbose:
             print(f"\n{'='*60}")
-            print(f"Processing timepoint {t+1}/{n_timepoints}")
+            print(f"Processing timepoint {t} ({idx+1}/{len(timepoints_to_process)})")
             print(f"{'='*60}")
         
         # Extract current timepoint
@@ -476,7 +503,117 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
     return all_masks
 
 
+def combine_timepoint_files(input_dir, output_path=None, gamma=None, file_pattern="T*_masks.tif", 
+                           verbose=True):
+    """
+    Find and combine individual timepoint TIF files into a single video file.
+    
+    Parameters:
+    -----------
+    input_dir : str
+        Directory containing the individual timepoint files
+    output_path : str or None
+        Path for the output combined video file. If None, will auto-generate based on input_dir
+    gamma : float or None
+        Gamma value to filter files by. If specified, only combines files with this gamma value.
+        If None, combines all files matching the pattern (assumes no gamma suffix)
+    file_pattern : str
+        Glob pattern to match timepoint files. Default is "T*_masks.tif"
+    verbose : bool
+        Print progress information
+        
+    Returns:
+    --------
+    combined_video : numpy.ndarray
+        Combined video with shape (t, z, y, x) or (t, y, x)
+    output_path : str
+        Path where the video was saved
+    """
+    import glob
+    import re
+    from pathlib import Path
+    
+    input_dir = Path(input_dir)
+    
+    # Build the search pattern based on gamma
+    if gamma is not None:
+        gamma_str = f"_gamma{gamma:.2f}"
+        # Replace the pattern to include gamma
+        pattern = file_pattern.replace("_masks.tif", f"{gamma_str}_masks.tif")
+    else:
+        pattern = file_pattern
+    
+    # Find all matching files
+    search_path = input_dir / pattern
+    files = sorted(glob.glob(str(search_path)))
+    
+    if len(files) == 0:
+        raise ValueError(f"No files found matching pattern: {search_path}")
+    
+    if verbose:
+        print(f"Found {len(files)} timepoint files in {input_dir}")
+    
+    # Extract timepoint numbers and sort files
+    file_info = []
+    for file_path in files:
+        filename = Path(file_path).name
+        # Extract timepoint number (e.g., T0005 -> 5)
+        match = re.search(r'T(\d+)', filename)
+        if match:
+            t_idx = int(match.group(1))
+            file_info.append((t_idx, file_path))
+        else:
+            if verbose:
+                print(f"Warning: Could not extract timepoint from {filename}, skipping")
+    
+    # Sort by timepoint index
+    file_info.sort(key=lambda x: x[0])
+    
+    if len(file_info) == 0:
+        raise ValueError("No valid timepoint files found with extractable timepoint numbers")
+    
+    if verbose:
+        print(f"Loading and combining {len(file_info)} timepoints...")
+        print(f"Timepoint range: T{file_info[0][0]:04d} to T{file_info[-1][0]:04d}")
+    
+    # Load all timepoints
+    frames = []
+    for t_idx, file_path in file_info:
+        if verbose:
+            print(f"  Loading {Path(file_path).name}...")
+        frame = tiff.imread(file_path)
+        frames.append(frame)
+    
+    # Stack into video
+    combined_video = np.array(frames)
+    
+    if verbose:
+        print(f"Combined video shape: {combined_video.shape}")
+    
+    # Generate output path if not provided
+    if output_path is None:
+        if gamma is not None:
+            gamma_suffix = f"_gamma{gamma:.2f}"
+        else:
+            gamma_suffix = ""
+        output_path = input_dir / f"combined_video{gamma_suffix}_masks.tif"
+    else:
+        output_path = Path(output_path)
+    
+    # Save combined video
+    if verbose:
+        print(f"Saving combined video to {output_path}")
+    tiff.imwrite(str(output_path), combined_video.astype(np.uint16))
+    
+    if verbose:
+        print("Done!")
+    
+    return combined_video, str(output_path)
+
+
 if __name__ == "__main__":
+    import argparse
+    
     try:
         version = getattr(cellpose, '__version__', None)
         if not version:
@@ -491,25 +628,113 @@ if __name__ == "__main__":
     except Exception as e:
         print('Could not determine Cellpose version:', e)
 
-    # Example usage
-    pretrained_model_path = r'/Users/ewheeler/.cellpose/models/CP_20250430_181517'
-    model = CellposeModel(gpu=True, pretrained_model=pretrained_model_path)
+    # Set up command-line argument parser
+    parser = argparse.ArgumentParser(
+        description='Tiled 3D segmentation with Cellpose for large timelapses',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+                Examples:
+                # Segment all timepoints with default settings
+                python tiled_segmentation.py --video video.tif --output results/ --model /path/to/model
+                
+                # Segment with gamma correction
+                python tiled_segmentation.py --video video.tif --output results/ --model /path/to/model --gamma 0.8
+                
+                # Segment specific timepoint range
+                python tiled_segmentation.py --video video.tif --output results/ --model /path/to/model --t_range 0 10
+                
+                # Segment specific timepoints
+                python tiled_segmentation.py --video video.tif --output results/ --model /path/to/model --t_list 0 5 10 15
+                
+                # Custom tile size and overlap
+                python tiled_segmentation.py --video video.tif --output results/ --model /path/to/model --tile_size 128 128 128 --overlap 64
+                        '''
+                    )
     
+    parser.add_argument('--video', type=str, help='Path to input video file')
+    parser.add_argument('--output', type=str, help='Output directory for results')
+    parser.add_argument('--model', type=str, help='Path to pretrained Cellpose model')
+    parser.add_argument('--tile_size', nargs=3, type=int, default=[256, 256, 256],
+                       help='Tile size (z y x). Default: 256 256 256')
+    parser.add_argument('--overlap', type=int, default=32,
+                       help='XY overlap in pixels. Default: 32')
+    parser.add_argument('--gamma', type=float, default=1.0,
+                       help='Gamma correction value (< 1 brightens, > 1 darkens). Default: 1.0')
+    parser.add_argument('--t_range', nargs=2, type=int, metavar=('START', 'END'),
+                       help='Timepoint range to process (start end, exclusive). E.g., --t_range 0 10')
+    parser.add_argument('--t_list', nargs='+', type=int, metavar='T',
+                       help='Specific timepoints to process. E.g., --t_list 0 5 10 15')
+    parser.add_argument('--no_normalize', action='store_true',
+                       help='Skip normalization to [0, 1] range')
+    parser.add_argument('--gpu', action='store_true', default=True,
+                       help='Use GPU (default: True)')
+    parser.add_argument('--no_gpu', dest='gpu', action='store_false',
+                       help='Do not use GPU')
+    parser.add_argument('--quiet', action='store_true',
+                       help='Suppress verbose output')
     
+    args = parser.parse_args()
+    
+    # Check if running with command-line arguments or using example code
+    if args.video and args.output and args.model:
+        # Command-line mode
+        print("Running in command-line mode...")
+        
+        # Prepare t_range parameter
+        t_range = None
+        if args.t_list is not None:
+            t_range = args.t_list
+            print(f"Processing specific timepoints: {t_range}")
+        elif args.t_range is not None:
+            t_range = tuple(args.t_range)
+            print(f"Processing timepoint range: {t_range[0]} to {t_range[1]}")
+        else:
+            print("Processing all timepoints")
+        
+        # Load model
+        print(f"Loading model from {args.model}")
+        model = CellposeModel(gpu=args.gpu, pretrained_model=args.model)
+        
+        # Run segmentation
+        all_masks = segment_timelapse(
+            video_path=args.video,
+            output_dir=args.output,
+            model=model,
+            tile_size=tuple(args.tile_size),
+            overlap_xy=args.overlap,
+            gamma=args.gamma,
+            t_range=t_range,
+            normalize=not args.no_normalize,
+            verbose=not args.quiet
+        )
+        
+        print(f"\nSegmentation complete!")
+        print(f"Output shape: {all_masks.shape}")
+        print(f"Results saved to: {args.output}")
+        
+    else:
+        # Example mode (original behavior)
+        print("Running in example mode (no command-line args provided)...")
+        print("Use --help to see command-line options\n")
+        
+        pretrained_model_path = r'/Users/ewheeler/.cellpose/models/CP_20250430_181517'
+        model = CellposeModel(gpu=True, pretrained_model=pretrained_model_path)
 
-    # Example: Process timelapse video with gamma transformation
-    video_path = r"/Users/ewheeler/cellpose3_testing/data/timelapse_video.tif"
-    output_dir = r"/Users/ewheeler/cellpose3_testing/data/timelapse_results"
-    
-    all_masks = segment_timelapse(
-        video_path=video_path,
-        output_dir=output_dir,
-        model=model,
-        tile_size=(256, 128, 128),
-        overlap_xy=32,
-        gamma=0.8,  # Apply gamma correction (< 1 brightens, > 1 darkens, 1.0 = no change)
-        verbose=True
-    )
-    
-    print(f"\nFinal output shape: {all_masks.shape}")
+        # Example: Process timelapse video with gamma transformation
+        video_path = r"/Users/ewheeler/cellpose3_testing/data/T0_32bit_xy.tif"
+        output_dir = r"/Users/ewheeler/cellpose3_testing/data/"
+        
+        all_masks = segment_timelapse(
+            video_path=video_path,
+            output_dir=output_dir,
+            model=model,
+            tile_size=(256, 256, 256),
+            overlap_xy=32,
+            gamma=0.8,  # Apply gamma correction (< 1 brightens, > 1 darkens, 1.0 = no change)
+            t_range=None,  # Options: None (all), (0, 10) (range), or [0, 5, 10] (specific frames)
+            verbose=True
+        )
+        
+        print(f"\nFinal output shape: {all_masks.shape}")
+
     
