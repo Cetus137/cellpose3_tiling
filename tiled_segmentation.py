@@ -285,38 +285,37 @@ def segment_large_image(image, model, tile_size=(256, 256, 256), overlap_xy=32,
     if all(image.shape[i] <= tile_size[i] for i in range(3)):
         if verbose:
             print("Image fits in single tile, processing without tiling...")
-        return segment_zstack(image, model, cellpose_config_dict)
-    
-    # Tile the image
-    if verbose:
-        print("Tiling image...")
-    tiles = tile_image_3d(image, tile_size, overlap_xy)
-    if verbose:
-        print(f"Created {len(tiles)} tiles")
-    
-    # Segment each tile
-    if verbose:
-        print("Segmenting tiles...")
-    for i, tile_info in enumerate(tiles):
+        dP_blur, cell_prob_blur = segment_zstack(image, model, cellpose_config_dict)
+    else:
         if verbose:
-            print(f"Processing tile {i+1}/{len(tiles)}")
-            print(f"  Position: z=[{tile_info['z_start']}:{tile_info['z_end']}], "
-                  f"y=[{tile_info['y_start']}:{tile_info['y_end']}], "
-                  f"x=[{tile_info['x_start']}:{tile_info['x_end']}]")
+            print("Image exceeds tile size, proceeding with tiled segmentation...")
+        tiles = tile_image_3d(image, tile_size, overlap_xy)
+        if verbose:
+            print(f"Created {len(tiles)} tiles")
         
-        # Segment the tile
-        dP_blur_tile, cell_prob_blur_tile = segment_zstack(
-            tile_info['data'], model, cellpose_config_dict
-        )
+        # Segment each tile
+        if verbose:
+            print("Segmenting tiles...")
+        for i, tile_info in enumerate(tiles):
+            if verbose:
+                print(f"Processing tile {i+1}/{len(tiles)}")
+                print(f"  Position: z=[{tile_info['z_start']}:{tile_info['z_end']}], "
+                    f"y=[{tile_info['y_start']}:{tile_info['y_end']}], "
+                    f"x=[{tile_info['x_start']}:{tile_info['x_end']}]")
+            
+            # Segment the tile
+            dP_blur_tile, cell_prob_blur_tile = segment_zstack(
+                tile_info['data'], model, cellpose_config_dict
+            )
+            
+            # Store results in tile_info
+            tile_info['dP_blur'] = dP_blur_tile
+            tile_info['cell_prob_blur'] = cell_prob_blur_tile
         
-        # Store results in tile_info
-        tile_info['dP_blur'] = dP_blur_tile
-        tile_info['cell_prob_blur'] = cell_prob_blur_tile
-    
-    # Reconstruct full image from tiles
-    if verbose:
-        print("Reconstructing from tiles...")
-    dP_blur, cell_prob_blur = reconstruct_from_tiles(tiles, image.shape, overlap_xy)
+        # Reconstruct full image from tiles
+        if verbose:
+            print("Reconstructing from tiles...")
+        dP_blur, cell_prob_blur = reconstruct_from_tiles(tiles, image.shape, overlap_xy)
     
     # Compute final masks on reconstructed data
     if verbose:
@@ -399,14 +398,18 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
     if video.ndim == 3:
         # Single timepoint, add time dimension
         video = video[np.newaxis, ...]
-        is_timelapse = False
         if verbose:
             print("Single timepoint detected, processing as single frame")
     elif video.ndim == 4:
-        is_timelapse = True
         if verbose:
             print(f"Timelapse detected with {video.shape[0]} timepoints")
+    elif video.ndim == 5:
+            if verbose:
+                print(f"5D video detected with {video.shape[0]} timepoints, collapsing to 4D")
+            # Collapse to 4D by squeezing singleton dimensions
+            video = np.squeeze(video, axis=1)
     else:
+
         raise ValueError(f"Expected 3D or 4D video, got shape {video.shape}")
     
     n_timepoints = video.shape[0]
