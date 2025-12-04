@@ -3,7 +3,7 @@ import tifffile as tiff
 import numpy as np
 import scipy.ndimage as ndi
 from cellpose.dynamics import compute_masks
-from segmentation import segment_zstack
+from segmentation_3views import segment_zstack_3views
 import cellpose
 from importlib.metadata import version as _getv
 import pkg_resources
@@ -48,7 +48,7 @@ def apply_gamma_transform(image, gamma=1.0):
     return image_transformed.astype(original_dtype)
 
 
-def tile_image_3d(image, tile_size=(256, 256, 256), overlap_xy=32):
+def tile_image_3d_3views(image, tile_size=(256, 256, 256), overlap_xy=32):
     """
     Tile a 3D image into overlapping tiles.
     
@@ -70,7 +70,7 @@ def tile_image_3d(image, tile_size=(256, 256, 256), overlap_xy=32):
             - 'y_start', 'y_end': y coordinates  
             - 'x_start', 'x_end': x coordinates
     """
-    z_size, y_size, x_size = image.shape
+    views, z_size, y_size, x_size = image.shape
     tile_z, tile_y, tile_x = tile_size
     
     tiles = []
@@ -93,12 +93,12 @@ def tile_image_3d(image, tile_size=(256, 256, 256), overlap_xy=32):
                 x_end = min(x_start + tile_x, x_size)
                 
                 # Extract tile
-                tile_data = image[z_start:z_end, y_start:y_end, x_start:x_end]
+                tile_data = image[:, z_start:z_end, y_start:y_end, x_start:x_end]
                 
                 # Pad tile if it's smaller than tile_size
-                if tile_data.shape != tile_size:
-                    padded_tile = np.zeros(tile_size, dtype=image.dtype)
-                    padded_tile[:tile_data.shape[0], :tile_data.shape[1], :tile_data.shape[2]] = tile_data
+                if tile_data.shape[1:] != tile_size:
+                    padded_tile = np.zeros((tile_data.shape[0],) + tile_size, dtype=image.dtype)
+                    padded_tile[:, :tile_data.shape[1], :tile_data.shape[2], :tile_data.shape[3]] = tile_data
                     tile_data = padded_tile
                 
                 tiles.append({
@@ -115,7 +115,7 @@ def tile_image_3d(image, tile_size=(256, 256, 256), overlap_xy=32):
     return tiles
 
 
-def reconstruct_from_tiles(tiles, image_shape, overlap_xy=32):
+def reconstruct_from_tiles_3views(tiles, image_shape, overlap_xy=32):
     """
     Reconstruct dP_blur and cell_prob_blur from segmented tiles by averaging overlaps.
     
@@ -183,7 +183,6 @@ def reconstruct_from_tiles(tiles, image_shape, overlap_xy=32):
     
     return dP_blur, cell_prob_blur
 
-
 def create_weight_map(tile_shape, overlap_xy, z_start, z_end, y_start, y_end, x_start, x_end, image_shape):
     """
     Create a weight map for blending tiles in overlap regions.
@@ -246,19 +245,19 @@ def create_weight_map(tile_shape, overlap_xy, z_start, z_end, y_start, y_end, x_
     return weight_map
 
 
-def segment_large_image(image, model, tile_size=(256, 256, 256), overlap_xy=32, 
+def segment_large_image_3views(image, model, tile_size=(256, 256, 256), overlap_xy=32, 
                        cellpose_config_dict=None, verbose=True):
     """
-    Segment a large 3D image using tiled segmentation.
+    Segment a large 3 view 3D image using tiled segmentation.
     
     Parameters:
     -----------
     image : numpy.ndarray
-        Input 3D image with shape (z, y, x)
+        Input 3D image with shape (views, z, y, x)
     model : CellposeModel
         Cellpose model to use for segmentation
     tile_size : tuple
-        Size of each tile (z, y, x). Default is (256, 256, 256)
+        Size of each tile (views, z, y, x). Default is (256, 256, 256)
     overlap_xy : int
         Overlap in pixels for XY dimensions. Default is 32
     cellpose_config_dict : dict
@@ -280,16 +279,19 @@ def segment_large_image(image, model, tile_size=(256, 256, 256), overlap_xy=32,
         print(f"Input image shape: {image.shape}")
         print(f"Tile size: {tile_size}")
         print(f"XY overlap: {overlap_xy}")
+        print(f'image min: {np.min(image)}, image max: {np.max(image)}')
+
+    
     
     # Check if tiling is necessary
     if all(image.shape[i] <= tile_size[i] for i in range(3)):
         if verbose:
             print("Image fits in single tile, processing without tiling...")
-        dP_blur, cell_prob_blur = segment_zstack(image, model, cellpose_config_dict)
+        dP_blur, cell_prob_blur = segment_zstack_3views(image, model, cellpose_config_dict)
     else:
         if verbose:
             print("Image exceeds tile size, proceeding with tiled segmentation...")
-        tiles = tile_image_3d(image, tile_size, overlap_xy)
+        tiles = tile_image_3d_3views(image, tile_size, overlap_xy)
         if verbose:
             print(f"Created {len(tiles)} tiles")
         
@@ -304,7 +306,7 @@ def segment_large_image(image, model, tile_size=(256, 256, 256), overlap_xy=32,
                     f"x=[{tile_info['x_start']}:{tile_info['x_end']}]")
             
             # Segment the tile
-            dP_blur_tile, cell_prob_blur_tile = segment_zstack(
+            dP_blur_tile, cell_prob_blur_tile = segment_zstack_3views(
                 tile_info['data'], model, cellpose_config_dict
             )
             
@@ -315,14 +317,14 @@ def segment_large_image(image, model, tile_size=(256, 256, 256), overlap_xy=32,
         # Reconstruct full image from tiles
         if verbose:
             print("Reconstructing from tiles...")
-        dP_blur, cell_prob_blur = reconstruct_from_tiles(tiles, image.shape, overlap_xy)
+        dP_blur, cell_prob_blur = reconstruct_from_tiles_3views(tiles, image.shape[1:], overlap_xy)
     
     # Compute final masks on reconstructed data
     if verbose:
         print("Computing final masks...")
     
     default_config = {
-        'cell_prob_threshold': 0.0,
+        'cell_prob_threshold': 1.0,
     }
     config = {**default_config, **(cellpose_config_dict or {})}
     
@@ -337,16 +339,16 @@ def segment_large_image(image, model, tile_size=(256, 256, 256), overlap_xy=32,
     
     if verbose:
         print("Segmentation complete!")
+        print(f'masks max: {np.max(masks)}, masks min: {np.min(masks)}')
     
     return dP_blur, cell_prob_blur, masks
 
-
-def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256), 
+def segment_timelapse_3views(video_path, output_dir, model, tile_size=(256, 256, 256), 
                      overlap_xy=32, cellpose_config_dict=None, normalize=True,
                      gamma=1.0, t_range=None, verbose=True):
     """
-    Segment a timelapse video (4D: time, z, y, x) using tiled segmentation.
-    
+    Segment a timelapse video (5D: views, time, z, y, x) using tiled segmentation.
+
     Parameters:
     -----------
     video_path : str
@@ -393,27 +395,24 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
     
     if verbose:
         print(f"Video shape: {video.shape}")
+        print(f"number of video.ndim: {video.ndim}")
     
-    # Determine if video is 4D (timelapse) or 3D (single timepoint)
-    if video.ndim == 3:
-        # Single timepoint, add time dimension
-        video = video[np.newaxis, ...]
-        if verbose:
-            print("Single timepoint detected, processing as single frame")
-
-    elif video.ndim == 4:
-        if verbose:
-            print(f"Timelapse detected with {video.shape[0]} timepoints")
-
-    elif video.ndim == 5:
-        if verbose:
-            print(f"5D video detected with {video.shape[0]} timepoints, collapsing to 4D")
-        # Collapse to 4D by squeezing singleton dimensions
-        video = np.squeeze(video, axis=1)
+    if video.ndim == 5 :
+        print(f"found 5D video (views, time, z, y, x) with shape {video.shape}")
+        
+    elif video.shape[0] == 3 and video.ndim ==4:
+        print("Warning: video has 4 dimensions with 3 views, assuming single timepoint.")
+        # Add a time dimension
+        video = video[:, np.newaxis, ...]
     else:
-        raise ValueError(f"Expected 3D or 4D video, got shape {video.shape}")
+        raise ValueError(f"Expected 5D video (views, time, z, y, x) or single timepoint, got shape {video.shape}")
     
-    n_timepoints = video.shape[0]
+    if video.shape[0] != 3:
+        raise ValueError(f"Expected 3 views in first dimension, got {video.shape[0]}")
+
+    
+    
+    n_timepoints = video.shape[1]
     
     # Determine which timepoints to process
     if t_range is None:
@@ -449,8 +448,9 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
         if verbose:
             print(f"Applying gamma transformation (gamma={gamma})...")
         # Apply gamma frame by frame (only to timepoints we're processing)
-        for t in timepoints_to_process:
-            video[t] = apply_gamma_transform(video[t], gamma=gamma)
+        for view in range(video.shape[0]):
+            for t in timepoints_to_process:
+                video[view, t] = apply_gamma_transform(video[view, t], gamma=gamma)
     
     # Create filename suffix with gamma parameter
     gamma_suffix = f"_gamma{gamma:.2f}" if gamma is not None else ""
@@ -466,11 +466,12 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
             print(f"{'='*60}")
         
         # Extract current timepoint
-        frame = video[t]
+        frame_3views = video[:, t , ...]
+        print(f"Frame 3views shape: {frame_3views.shape}")
         
         # Segment the frame
-        dP_blur, cell_prob_blur, masks = segment_large_image(
-            frame,
+        dP_blur, cell_prob_blur, masks = segment_large_image_3views(
+            frame_3views,
             model,
             tile_size=tile_size,
             overlap_xy=overlap_xy,
@@ -505,119 +506,6 @@ def segment_timelapse(video_path, output_dir, model, tile_size=(256, 256, 256),
         print(f"Total timepoints processed: {n_timepoints}")
     
     return all_masks
-
-
-
-
-
-
-
-def combine_timepoint_files(input_dir, output_path=None, gamma=None, file_pattern="T*_masks.tif", 
-                           verbose=True):
-    """
-    Find and combine individual timepoint TIF files into a single video file.
-    
-    Parameters:
-    -----------
-    input_dir : str
-        Directory containing the individual timepoint files
-    output_path : str or None
-        Path for the output combined video file. If None, will auto-generate based on input_dir
-    gamma : float or None
-        Gamma value to filter files by. If specified, only combines files with this gamma value.
-        If None, combines all files matching the pattern (assumes no gamma suffix)
-    file_pattern : str
-        Glob pattern to match timepoint files. Default is "T*_masks.tif"
-    verbose : bool
-        Print progress information
-        
-    Returns:
-    --------
-    combined_video : numpy.ndarray
-        Combined video with shape (t, z, y, x) or (t, y, x)
-    output_path : str
-        Path where the video was saved
-    """
-    import glob
-    import re
-    from pathlib import Path
-    
-    input_dir = Path(input_dir)
-    
-    # Build the search pattern based on gamma
-    if gamma is not None:
-        gamma_str = f"_gamma{gamma:.2f}"
-        # Replace the pattern to include gamma
-        pattern = file_pattern.replace("_masks.tif", f"{gamma_str}_masks.tif")
-    else:
-        pattern = file_pattern
-    
-    # Find all matching files
-    search_path = input_dir / pattern
-    files = sorted(glob.glob(str(search_path)))
-    
-    if len(files) == 0:
-        raise ValueError(f"No files found matching pattern: {search_path}")
-    
-    if verbose:
-        print(f"Found {len(files)} timepoint files in {input_dir}")
-    
-    # Extract timepoint numbers and sort files
-    file_info = []
-    for file_path in files:
-        filename = Path(file_path).name
-        # Extract timepoint number (e.g., T0005 -> 5)
-        match = re.search(r'T(\d+)', filename)
-        if match:
-            t_idx = int(match.group(1))
-            file_info.append((t_idx, file_path))
-        else:
-            if verbose:
-                print(f"Warning: Could not extract timepoint from {filename}, skipping")
-    
-    # Sort by timepoint index
-    file_info.sort(key=lambda x: x[0])
-    
-    if len(file_info) == 0:
-        raise ValueError("No valid timepoint files found with extractable timepoint numbers")
-    
-    if verbose:
-        print(f"Loading and combining {len(file_info)} timepoints...")
-        print(f"Timepoint range: T{file_info[0][0]:04d} to T{file_info[-1][0]:04d}")
-    
-    # Load all timepoints
-    frames = []
-    for t_idx, file_path in file_info:
-        if verbose:
-            print(f"  Loading {Path(file_path).name}...")
-        frame = tiff.imread(file_path)
-        frames.append(frame)
-    
-    # Stack into video
-    combined_video = np.array(frames)
-    
-    if verbose:
-        print(f"Combined video shape: {combined_video.shape}")
-    
-    # Generate output path if not provided
-    if output_path is None:
-        if gamma is not None:
-            gamma_suffix = f"_gamma{gamma:.2f}"
-        else:
-            gamma_suffix = ""
-        output_path = input_dir / f"combined_video{gamma_suffix}_masks.tif"
-    else:
-        output_path = Path(output_path)
-    
-    # Save combined video
-    if verbose:
-        print(f"Saving combined video to {output_path}")
-    tiff.imwrite(str(output_path), combined_video.astype(np.uint16))
-    
-    if verbose:
-        print("Done!")
-    
-    return combined_video, str(output_path)
 
 
 if __name__ == "__main__":
@@ -703,7 +591,7 @@ if __name__ == "__main__":
         model = CellposeModel(gpu=args.gpu, pretrained_model=args.model)
         
         # Run segmentation
-        all_masks = segment_timelapse(
+        all_masks = segment_timelapse_3views(
             video_path=args.video,
             output_dir=args.output,
             model=model,
@@ -718,30 +606,5 @@ if __name__ == "__main__":
         print(f"\nSegmentation complete!")
         print(f"Output shape: {all_masks.shape}")
         print(f"Results saved to: {args.output}")
-        
-    else:
-        # Example mode (original behavior)
-        print("Running in example mode (no command-line args provided)...")
-        print("Use --help to see command-line options\n")
-        
-        pretrained_model_path = r'/Users/ewheeler/.cellpose/models/CP_20250430_181517'
-        model = CellposeModel(gpu=True, pretrained_model=pretrained_model_path)
-
-        # Example: Process timelapse video with gamma transformation
-        video_path = r"/Users/ewheeler/cellpose3_testing/data/T0_32bit_xy.tif"
-        output_dir = r"/Users/ewheeler/cellpose3_testing/data/"
-        
-        all_masks = segment_timelapse(
-            video_path=video_path,
-            output_dir=output_dir,
-            model=model,
-            tile_size=(256, 256, 256),
-            overlap_xy=32,
-            gamma=0.8,  # Apply gamma correction (< 1 brightens, > 1 darkens, 1.0 = no change)
-            t_range=None,  # Options: None (all), (0, 10) (range), or [0, 5, 10] (specific frames)
-            verbose=True
-        )
-        
-        print(f"\nFinal output shape: {all_masks.shape}")
 
     
