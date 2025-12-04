@@ -7,38 +7,6 @@ import cellpose
 from importlib.metadata import version as _getv
 import pkg_resources
 
-
-def batch_2D_images(input_dir, output_dir, config, model_path):
-    """
-    Segment all 2D images in input_dir and save results to output_dir.
-    """
-    import os
-    from pathlib import Path
-    
-    model = CellposeModel(gpu=True , pretrained_model=model_path)
-
-    input_dir = Path(input_dir)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Find all TIF files
-    tif_files = sorted(input_dir.glob("*.tif"))
-
-    for file_path in tif_files:
-        print(f"Processing {file_path.name}...")
-        image = tiff.imread(file_path)
-
-        masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0],
-                                         batch_size=config['batch_size'], do_3D=False,
-                                         min_size=config['min_size'])
-
-        # Save masks
-        output_path = output_dir / f"{file_path.stem}_masks.tif"
-        tiff.imwrite(output_path, masks.astype(np.uint16))
-        print(f"  Saved masks to {output_path}")
-
-
-
 def segment_3D_stack(image_stack, config, view):
 
     shape = image_stack.shape
@@ -118,7 +86,7 @@ def segment_3views(image_xy, image_xz, image_yz, config):
     print(cell_prob.shape)
     return dP, cell_prob
 
-def segment_zstack(vid_frame, model, cellpose_config_dict=None):
+def segment_zstack_3views(vid_frame_3views, model, cellpose_config_dict=None):
     '''
     segment a single timepoint 3D frame with cellpose.
 
@@ -146,16 +114,16 @@ def segment_zstack(vid_frame, model, cellpose_config_dict=None):
 
     config = {**default_config, **(cellpose_config_dict or {})}
 
-    img_xy = vid_frame                          #video in shape (z,y,x)
-    img_xz = np.transpose(vid_frame, (1,0,2))   #transpose to (y,z,x)
-    img_yz = np.transpose(vid_frame, (2,0,1))   #transpose to (x,z,y) 
+    img_xy = np.transpose(vid_frame_3views[0,...], (0, 1, 2))   #shape (z,y,x)
+    img_xz = np.transpose(vid_frame_3views[1,...], (1 ,0, 2))   #transpose to (y,z,x)
+    img_yz = np.transpose(vid_frame_3views[2,...], (2, 0, 1))   #transpose to (x,z,y) 
 
     print('image shapes:', img_xy.shape, img_xz.shape, img_yz.shape)
 
     dP , cell_prob = segment_3views(img_xy, img_xz, img_yz, config)
 
     cell_prob_blur = ndi.gaussian_filter(cell_prob, sigma=2)
-    cell_prob_blur = np.clip(cell_prob_blur, -6, 6)
+    cell_prob_blur = np.clip(cell_prob_blur, -6, 12)
     dP_blur = ndi.gaussian_filter(dP, sigma=(0,2,2,2))
 
     print('computing masks...')
@@ -178,13 +146,17 @@ if __name__ == "__main__":
     except Exception as e:
         print('Could not determine Cellpose version:', e)
 
-    config = {
-        'batch_size': 1,
-        'min_size': 100, # to be set later
-    }
+    pretrained_model_path = r'/Users/ewheeler/.cellpose/models/CP_20250430_181517'
+    model = CellposeModel(gpu=True , pretrained_model=pretrained_model_path)
+    img_path    = r"/Users/ewheeler/cellpose3_testing/data/T0_32bit_xy.tif"
+    output_path = r"/Users/ewheeler/cellpose3_testing/data/T0_32bit_xy_segmented.tif"
+    vid = tiff.imread(img_path)
+    print('video shape:', vid.shape)
 
-    pretrained_model_path = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/models/CP_20250430_181517'
-    input_dir             = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data/node2_z85_z89_256'
-    output_dir            = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/node2_z85_z89_segmented'
+    #first normalize the video to range 0-1
+    vid = vid.astype(np.float32)
+    vid = (vid - np.min(vid)) / (np.max(vid) - np.min(vid))
 
-    batch_2D_images(input_dir, output_dir, config, pretrained_model_path)
+    segment_zstack(vid, model)
+
+
