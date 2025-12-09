@@ -324,7 +324,7 @@ def segment_large_image_3views(image, model, tile_size=(256, 256, 256), overlap_
         print("Computing final masks...")
     
     default_config = {
-        'cell_prob_threshold': 1.0,
+        'cell_prob_threshold': 8.0,
     }
     config = {**default_config, **(cellpose_config_dict or {})}
     

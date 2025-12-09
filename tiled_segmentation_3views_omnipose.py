@@ -1,8 +1,9 @@
-from omnipose.models import Omnipose
+from cellpose_omni.models import CellposeModel
 import tifffile as tiff
 import numpy as np
 import scipy.ndimage as ndi
-from cellpose_omni.dynamics import compute_masks
+#from cellpose_omni.dynamics import compute_masks
+from omnipose.core import compute_masks
 from segmentation_3views_omnipose import segment_zstack_3views
 import omnipose
 from importlib.metadata import version as _getv
@@ -324,17 +325,19 @@ def segment_large_image_3views(image, model, tile_size=(256, 256, 256), overlap_
         print("Computing final masks...")
     
     default_config = {
-        'mask_threshold': 1.0,
+        'mask_threshold': 6.0,
+        'cluster': False,
     }
     config = {**default_config, **(omnipose_config_dict or {})}
     
-    masks  = compute_masks(
+    masks, p, tr, bd, augmented = compute_masks(
         dP_blur, 
         cell_prob_blur, 
         flow_threshold=0.4, 
         min_size=5000, 
         do_3D=True, 
-        mask_threshold=config['mask_threshold']
+        mask_threshold=config['mask_threshold'],
+        cluster=config['cluster']
     )
     
     if verbose:
@@ -588,7 +591,7 @@ if __name__ == "__main__":
         
         # Load model
         print(f"Loading model from {args.model}")
-        model = Omnipose(gpu=args.gpu, pretrained_model=args.model)
+        model = CellposeModel(gpu=args.gpu, pretrained_model=args.model, nchan=1, nclasses=3)
         
         # Run segmentation
         all_masks = segment_timelapse_3views(

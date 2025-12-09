@@ -1,4 +1,4 @@
-from omnipose.models import Omnipose
+from cellpose_omni.models import CellposeModel
 import tifffile as tiff
 import numpy as np
 import scipy.ndimage as ndi
@@ -20,19 +20,21 @@ def segment_3D_stack(image_stack, config, view):
     if view == 'XY':
         for i in range(shape[0]):
             image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0], batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], 
-                                             cluster=config.get('cluster', False), omni=config.get('omni', True))
+            masks, flows, styles = model.eval(image, diameter=config.get('diameter', None), channels=None, batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], 
+                                             cluster=config.get('cluster', False), omni=config.get('omni', True) )
 
             flowsx_stack[i, :, :] = flows[1][1]
             flowsy_stack[i, :, :] = flows[1][0]
             cell_prob_stack[i, :, :] = flows[2]
+
+            print(type(flows), [f.shape if hasattr(f,'shape') else None for f in flows])
 
         tiff.imwrite('cellprob_xy_raw.tif', cell_prob_stack.astype(np.float32))
 
     elif view == 'XZ':
         for i in range(shape[0]):
             image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0], batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'],
+            masks, flows, styles = model.eval(image, diameter=config.get('diameter', None), channels=None, batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'],
                                              cluster=config.get('cluster', False), omni=config.get('omni', True))
 
             flowsx_stack[i, :, :] = flows[1][1]
@@ -45,6 +47,8 @@ def segment_3D_stack(image_stack, config, view):
         flowsy_stack = np.transpose(flowsy_stack, (1, 0, 2))
         cell_prob_stack = np.transpose(cell_prob_stack, (1, 0, 2))
 
+        print(type(flows), [f.shape if hasattr(f,'shape') else None for f in flows])
+
         print('after transpose', flowsz_stack.shape)
 
         tiff.imwrite('cellprob_xz_raw.tif', cell_prob_stack.astype(np.float32))
@@ -52,12 +56,13 @@ def segment_3D_stack(image_stack, config, view):
     elif view == 'YZ':
         for i in range(shape[0]):
             image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0], batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'],
+            masks, flows, styles = model.eval(image, diameter=config.get('diameter', None), channels=None, batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'],
                                              cluster=config.get('cluster', False), omni=config.get('omni', True))
 
             flowsy_stack[i, :, :] = flows[1][1]
             flowsz_stack[i, :, :] = flows[1][0]
             cell_prob_stack[i, :, :] = flows[2]
+            print(type(flows), [f.shape if hasattr(f,'shape') else None for f in flows])
 
         #transpose to be consistent with XY view
         flowsy_stack = np.transpose(flowsy_stack, (1, 2, 0))
@@ -104,13 +109,13 @@ def segment_zstack_3views(vid_frame_3views, model, omnipose_config_dict=None):
 
     default_config = {
         'model' : model,
-        'batch_size': 182,
+        'batch_size': 256,
         'do_3D': False,
-        'diameter': None,
+        'diameter': 40,
         'min_size': 100,
         'z_axis': 0,
         'gamma': 1.0,
-        'mask_threshold': 0.0,
+        'mask_threshold': 8.0,
         'use_gpu': True,
         'cluster': False,
         'omni': True
@@ -151,7 +156,7 @@ if __name__ == "__main__":
         print('Could not determine Omnipose version:', e)
 
     pretrained_model_path = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/models/omnipose_model'
-    model = Omnipose(gpu=True, pretrained_model=pretrained_model_path)
+    model = CellposeModel(gpu=True, pretrained_model=pretrained_model_path, nchan=1, nclasses=3)
     img_path    = r"/path/to/your/T0_32bit.tif"
     output_path = r"/path/to/your/T0_32bit_segmented.tif"
     

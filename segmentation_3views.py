@@ -21,18 +21,17 @@ def segment_3D_stack(image_stack, config, view):
     if view == 'XY':
         for i in range(shape[0]):
             image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'])
+            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'] , cellprob_threshold=config.get('cell_prob_threshold', 0.0) )
 
             flowsx_stack[i, :, :] = flows[1][1]
             flowsy_stack[i, :, :] = flows[1][0]
             cell_prob_stack[i, :, :] = flows[2]
 
         tiff.imwrite('cellprob_xy_raw.tif', cell_prob_stack.astype(np.float32))
-
     elif view == 'XZ':
         for i in range(shape[0]):
             image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'])
+            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0) )
 
             flowsx_stack[i, :, :] = flows[1][1]
             flowsz_stack[i, :, :] = flows[1][0]
@@ -51,7 +50,7 @@ def segment_3D_stack(image_stack, config, view):
     elif view == 'YZ':
         for i in range(shape[0]):
             image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0], batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'])
+            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0], batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0) )
 
             flowsy_stack[i, :, :] = flows[1][1]
             flowsz_stack[i, :, :] = flows[1][0]
@@ -108,7 +107,7 @@ def segment_zstack_3views(vid_frame_3views, model, cellpose_config_dict=None):
         'min_size': 100,
         'z_axis': 0,
         'gamma': 1.0,
-        'cell_prob_threshold': 0.0,
+        'cell_prob_threshold': 8.0,
         'use_gpu': True
     }
 

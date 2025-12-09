@@ -233,11 +233,16 @@ if __name__ == "__main__":
     parser.add_argument("--input_dir"   , type=str              , help="Directory containing individual timepoint TIF files.")
     parser.add_argument("--output_path" , type=str, default=None, help="Path to save the combined video. Defaults to 'combined_timelapse.tif' in input_dir.")
     parser.add_argument("--phrase"      , type=str, default=None, help="Optional substring to filter filenames.")
+    parser.add_argument("--three_views" , type=bool, default=False  , help="Indicates that input files have 3 views (shape: 3,Z,Y,X).")
     parser.add_argument("--verbose"     , action="store_true"   , help="Print progress information.")
     
     args = parser.parse_args()
     
-    #combine_timepoint_files(args.input_dir, args.output_path, args.phrase, args.verbose)
-    combine_timepoint_files(args.input_dir, args.output_path, args.phrase, args.verbose)
+    if args.three_views:
+        #combine_timepoint_files_3views(args.input_dir, args.output_path, args.phrase, args.verbose)
+        combine_timepoint_files_3views(args.input_dir, args.output_path, args.phrase, args.verbose)
+    elif not args.three_views:
+        #combine_timepoint_files(args.input_dir, args.output_path, args.phrase, args.verbose)
+        combine_timepoint_files(args.input_dir, args.output_path, args.phrase, args.verbose)
 
 
