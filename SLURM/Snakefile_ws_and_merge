@@ -1,0 +1,105 @@
+# Snakefile for watershed and merge workflow
+# Process individual timepoint files in parallel from segmentation directory
+
+import os
+import glob
+
+# Configuration
+INPUT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop3/segmentation"
+WATERSHED_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop3/watershed"
+MERGE_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop3/merged"
+SCRIPT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+
+# Watershed parameters
+MIN_DISTANCE = 5
+SIGMA = 1.0
+NUM_PEAKS = 2
+
+# Merge parameters
+INTERFACE_THRESHOLD = 0.10
+
+# Get list of input files and determine number of timepoints
+input_files = sorted(glob.glob(os.path.join(INPUT_DIR, "restored_timepoint_*_segmented.tif")))
+N_TIMEPOINTS = len(input_files)
+
+# Extract timepoint numbers from filenames
+timepoints = []
+for f in input_files:
+    basename = os.path.basename(f)
+    # Extract number from "restored_timepoint_XXXX_segmented.tif"
+    tp = basename.replace("restored_timepoint_", "").replace("_segmented.tif", "")
+    timepoints.append(int(tp))
+
+# Rule to define the final outputs
+rule all:
+    input:
+        expand(os.path.join(WATERSHED_DIR, "restored_timepoint_{timepoint:04d}_segmented_ws.tif"),
+               timepoint=timepoints),
+        expand(os.path.join(MERGE_DIR, "restored_timepoint_{timepoint:04d}_segmented_merged_thresh{threshold:.2f}.tif"),
+               timepoint=timepoints,
+               threshold=INTERFACE_THRESHOLD)
+
+# Rule to apply watershed to individual timepoint files
+rule watershed_timepoint:
+    input:
+        os.path.join(INPUT_DIR, "restored_timepoint_{timepoint,\d{4}}_segmented.tif")
+    output:
+        os.path.join(WATERSHED_DIR, "restored_timepoint_{timepoint,\d{4}}_segmented_ws.tif")
+    params:
+        file_index = lambda wildcards: timepoints.index(int(wildcards.timepoint))
+    resources:
+        mem_mb = 64000,
+        runtime = 45,
+        cpus = 1,
+        slurm_extra = "'--exclude=compg009,compg010,compg011,compg013'"
+    log:
+        "slogs/watershed_timepoint_{timepoint}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        module load CUDA/12.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+        
+        python3 -u {SCRIPT_DIR}/watershed_seg.py \
+            --input_dir {INPUT_DIR} \
+            --output_dir {WATERSHED_DIR} \
+            --min_distance {MIN_DISTANCE} \
+            --sigma {SIGMA} \
+            --num_peaks_per_label {NUM_PEAKS} \
+            --file_index {params.file_index} \
+            --verbose &> {log}
+        """
+
+# Rule to merge individual timepoint files
+rule merge_timepoint:
+    input:
+        os.path.join(INPUT_DIR, "restored_timepoint_{timepoint,\d{4}}_segmented.tif")
+    output:
+        os.path.join(MERGE_DIR, "restored_timepoint_{timepoint,\d{4}}_segmented_merged_thresh{threshold}.tif")
+    params:
+        threshold = INTERFACE_THRESHOLD,
+        file_index = lambda wildcards: timepoints.index(int(wildcards.timepoint))
+    resources:
+        mem_mb = 64000,
+        runtime = 45,
+        cpus = 1,
+        slurm_extra = '--exclude=compg009,compg010,compg011,compg013'
+    log:
+        "slogs/merge_timepoint_{timepoint}_thresh{threshold}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        module load CUDA/12.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+        
+        python3 -u {SCRIPT_DIR}/merge_seg.py \
+            --input_dir {INPUT_DIR} \
+            --output_dir {MERGE_DIR} \
+            --interface_threshold {INTERFACE_THRESHOLD} \
+            --file_index {params.file_index} \
+            --verbose &> {log}
+        """

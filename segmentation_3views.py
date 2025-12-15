@@ -21,7 +21,8 @@ def segment_3D_stack(image_stack, config, view):
     if view == 'XY':
         for i in range(shape[0]):
             image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'] , cellprob_threshold=config.get('cell_prob_threshold', 0.0) )
+            masks, flows, styles = model.eval(image, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'] , cellprob_threshold=config.get('cell_prob_threshold', 0.0),
+                                              diameter=config.get('diameter', None) )
 
             flowsx_stack[i, :, :] = flows[1][1]
             flowsy_stack[i, :, :] = flows[1][0]
@@ -31,7 +32,8 @@ def segment_3D_stack(image_stack, config, view):
     elif view == 'XZ':
         for i in range(shape[0]):
             image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0) )
+            masks, flows, styles = model.eval(image, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0),
+                                              diameter=config.get('diameter', None) )
 
             flowsx_stack[i, :, :] = flows[1][1]
             flowsz_stack[i, :, :] = flows[1][0]
@@ -50,7 +52,8 @@ def segment_3D_stack(image_stack, config, view):
     elif view == 'YZ':
         for i in range(shape[0]):
             image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0], batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0) )
+            masks, flows, styles = model.eval(image, channels=[0, 0], batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0),
+                                              diameter=config.get('diameter', None) )
 
             flowsy_stack[i, :, :] = flows[1][1]
             flowsz_stack[i, :, :] = flows[1][0]
@@ -118,6 +121,7 @@ def segment_zstack_3views(vid_frame_3views, model, cellpose_config_dict=None):
     img_yz = np.transpose(vid_frame_3views[2,...], (2, 0, 1))   #transpose to (x,z,y) 
 
     print('image shapes:', img_xy.shape, img_xz.shape, img_yz.shape)
+    print(config)
 
     dP , cell_prob = segment_3views(img_xy, img_xz, img_yz, config)
 

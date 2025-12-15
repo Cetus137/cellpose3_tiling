@@ -345,7 +345,7 @@ def segment_large_image_3views(image, model, tile_size=(256, 256, 256), overlap_
 
 def segment_timelapse_3views(video_path, output_dir, model, tile_size=(256, 256, 256), 
                      overlap_xy=32, cellpose_config_dict=None, normalize=True,
-                     gamma=1.0, t_range=None, verbose=True):
+                     gamma=1.0, t_list=None, verbose=True, save_timepoint=True):
     """
     Segment a timelapse video (5D: views, time, z, y, x) using tiled segmentation.
 
@@ -368,11 +368,9 @@ def segment_timelapse_3views(video_path, output_dir, model, tile_size=(256, 256,
     gamma : float
         Gamma value for gamma transformation applied per frame before segmentation.
         gamma < 1 brightens, gamma > 1 darkens. Default is 1.0 (no change)
-    t_range : tuple, list, or None
-        Time range to process. Can be:
-        - None: process all timepoints (default)
-        - tuple (start, end): process timepoints from start to end (exclusive)
-        - list: process specific timepoint indices [0, 2, 5, 10]
+    t_list : list or None
+        Specific timepoint indices to process, e.g., [0, 2, 5, 10].
+        If None (default), process all timepoints.
     verbose : bool
         Print progress information
         
@@ -415,23 +413,15 @@ def segment_timelapse_3views(video_path, output_dir, model, tile_size=(256, 256,
     n_timepoints = video.shape[1]
     
     # Determine which timepoints to process
-    if t_range is None:
+    if t_list is None:
         # Process all timepoints
         timepoints_to_process = list(range(n_timepoints))
-    elif isinstance(t_range, (list, np.ndarray)):
+    else:
         # Process specific timepoints from list
-        timepoints_to_process = list(t_range)
+        timepoints_to_process = list(t_list)
         # Validate indices
         if any(t < 0 or t >= n_timepoints for t in timepoints_to_process):
-            raise ValueError(f"t_range contains invalid timepoint indices. Valid range: 0-{n_timepoints-1}")
-    elif isinstance(t_range, tuple) and len(t_range) == 2:
-        # Process range of timepoints
-        start, end = t_range
-        if start < 0 or end > n_timepoints:
-            raise ValueError(f"t_range ({start}, {end}) out of bounds. Valid range: 0-{n_timepoints}")
-        timepoints_to_process = list(range(start, end))
-    else:
-        raise ValueError("t_range must be None, a list of indices, or a tuple (start, end)")
+            raise ValueError(f"t_list contains invalid timepoint indices. Valid range: 0-{n_timepoints-1}")
     
     if verbose:
         print(f"Processing {len(timepoints_to_process)} timepoint(s): {timepoints_to_process}")
@@ -454,6 +444,8 @@ def segment_timelapse_3views(video_path, output_dir, model, tile_size=(256, 256,
     
     # Create filename suffix with gamma parameter
     gamma_suffix = f"_gamma{gamma:.2f}" if gamma is not None else ""
+
+    diam_suffix  = f"_diam{cellpose_config_dict['diameter']:.1f}" if cellpose_config_dict and 'diameter' in cellpose_config_dict and cellpose_config_dict['diameter'] is not None else ""
     
     # Initialize output array
     all_masks = []
@@ -482,31 +474,97 @@ def segment_timelapse_3views(video_path, output_dir, model, tile_size=(256, 256,
         # Store results
         all_masks.append(masks)
         
-        # Save individual timepoint mask
-        timepoint_prefix = output_dir / f"T{t:04d}{gamma_suffix}"
-        if verbose:
-            print(f"Saving timepoint {t} mask...")
-        
-        tiff.imwrite(str(timepoint_prefix) + "_masks.tif", masks.astype(np.uint16))
+        if save_timepoint:
+            # Save individual timepoint mask
+            timepoint_prefix = output_dir / f"T{t:04d}{gamma_suffix}{diam_suffix}"
+            if verbose:
+                print(f"Saving timepoint {t} mask...")
+            
+            tiff.imwrite(str(timepoint_prefix) + "_masks.tif", masks.astype(np.uint16))
     
     # Convert to numpy array
     all_masks = np.array(all_masks)
     
-    # Save complete video results
-    if verbose:
-        print(f"\n{'='*60}")
-        print("Saving complete video results...")
-        print(f"{'='*60}")
-    
-    video_output_prefix = output_dir / f"video_complete{gamma_suffix}"
-    tiff.imwrite(str(video_output_prefix) + "_masks.tif", all_masks.astype(np.uint16))
-    
-    if verbose:
-        print(f"\nAll results saved to {output_dir}")
-        print(f"Total timepoints processed: {n_timepoints}")
-    
     return all_masks
 
+def batch_tif_segment_timelapse_3views(input_dir, output_dir, model, file_index=None,
+                                   tile_size=(256, 256, 256), overlap_xy=32, 
+                                   cellpose_config_dict=None, normalize=True,
+                                   gamma=1.0, t_list=None, verbose=True, phrase='restored_timepoint'):
+    """
+    Batch process all .tif files in a directory for timelapse segmentation.
+    
+    Parameters:
+    -----------
+    input_dir : str
+        Directory containing input .tif files
+    output_dir : str
+        Directory to save output files
+    model : CellposeModel
+        Cellpose model to use for segmentation
+    tile_size : tuple
+        Size of each tile (z, y, x). Default is (256, 256, 256)
+    overlap_xy : int
+        Overlap in pixels for XY dimensions. Default is 32
+    cellpose_config_dict : dict
+        Dictionary of cellpose configuration parameters
+    normalize : bool
+        Whether to normalize the video to range 0-1. Default is True
+    gamma : float
+        Gamma value for gamma transformation applied per frame before segmentation.
+        gamma < 1 brightens, gamma > 1 darkens. Default is 1.0 (no change)
+    t_range : tuple, list, or None
+        Time range to process. Can be:
+        - None: process all timepoints (default)
+    """
+    import os
+    from pathlib import Path
+    from natsort import natsorted
+    
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tif_files = natsorted([f for f in os.listdir(input_dir) if f.lower().endswith('.tif')])
+    if verbose:
+        print(f"Found {len(tif_files)} .tif files in {input_dir}")
+
+    if phrase is not None:
+        tif_files = [f for f in tif_files if phrase in f]
+        if verbose:
+            print(f"Filtered files with phrase '{phrase}': {len(tif_files)} files remain")
+
+    if file_index is not None:
+        if file_index < 0 or file_index >= len(tif_files):
+            raise ValueError(f"file_index {file_index} is out of range. Found {len(tif_files)} .tif files.")
+        tif_files = [tif_files[file_index]]
+        if verbose:
+            print(f"Processing only file at index {file_index}: {tif_files[0]}")
+
+    for tif_file in tif_files:
+        input_path  = input_dir  / tif_file
+        output_path = output_dir / tif_file.replace('.tif', '_segmented.tif')
+        if verbose:
+            print(f"\nProcessing file: {tif_file}")
+
+        all_masks = segment_timelapse_3views(
+            video_path=str(input_path),
+            output_dir=str(output_dir),
+            model=model,
+            tile_size=tile_size,
+            overlap_xy=overlap_xy,
+            cellpose_config_dict=cellpose_config_dict,
+            normalize=normalize,
+            gamma=gamma,
+            t_list=t_list,
+            verbose=verbose,
+            save_timepoint=False
+        )
+
+        if verbose:
+            print(f"Saving all masks to {output_path}")
+        tiff.imwrite(str(output_path), all_masks.astype(np.uint16))
+
+    return 
 
 if __name__ == "__main__":
     import argparse
@@ -537,9 +595,6 @@ if __name__ == "__main__":
                 # Segment with gamma correction
                 python tiled_segmentation.py --video video.tif --output results/ --model /path/to/model --gamma 0.8
                 
-                # Segment specific timepoint range
-                python tiled_segmentation.py --video video.tif --output results/ --model /path/to/model --t_range 0 10
-                
                 # Segment specific timepoints
                 python tiled_segmentation.py --video video.tif --output results/ --model /path/to/model --t_list 0 5 10 15
                 
@@ -548,8 +603,9 @@ if __name__ == "__main__":
                         '''
                     )
     
-    parser.add_argument('--video', type=str, help='Path to input video file')
-    parser.add_argument('--output', type=str, help='Output directory for results')
+    parser.add_argument('--input_dir', type=str, help='Path to input directory containing .tif files')
+    parser.add_argument('--output_dir', type=str, help='Output directory for results')
+    parser.add_argument('--file_index', type=int, default=None, help='Index of specific file to process from input directory')
     parser.add_argument('--model', type=str, help='Path to pretrained Cellpose model')
     parser.add_argument('--tile_size', nargs=3, type=int, default=[256, 256, 256],
                        help='Tile size (z y x). Default: 256 256 256')
@@ -557,32 +613,27 @@ if __name__ == "__main__":
                        help='XY overlap in pixels. Default: 32')
     parser.add_argument('--gamma', type=float, default=1.0,
                        help='Gamma correction value (< 1 brightens, > 1 darkens). Default: 1.0')
-    parser.add_argument('--t_range', nargs=2, type=int, metavar=('START', 'END'),
-                       help='Timepoint range to process (start end, exclusive). E.g., --t_range 0 10')
-    parser.add_argument('--t_list', nargs='+', type=int, metavar='T',
-                       help='Specific timepoints to process. E.g., --t_list 0 5 10 15')
+    parser.add_argument('--t_list', nargs='+', type=int, metavar='T', default=None,
+                       help='Specific timepoints to process. E.g., --t_list 0 5 10 15. If not provided, all timepoints are processed.')
     parser.add_argument('--no_normalize', action='store_true',
                        help='Skip normalization to [0, 1] range')
     parser.add_argument('--gpu', action='store_true', default=True,
                        help='Use GPU (default: True)')
-    parser.add_argument('--quiet', action='store_true',
-                       help='Suppress verbose output')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Enable verbose output')
+    parser.add_argument('--diameter', type=float, default=None,
+                       help='Cell diameter for Cellpose model (default: None)')
     
     args = parser.parse_args()
     
     # Check if running with command-line arguments or using example code
-    if args.video and args.output and args.model:
+    if args.input_dir and args.output_dir and args.model:
         # Command-line mode
         print("Running in command-line mode...")
         
-        # Prepare t_range parameter
-        t_range = None
+        # Print timepoint info
         if args.t_list is not None:
-            t_range = args.t_list
-            print(f"Processing specific timepoints: {t_range}")
-        elif args.t_range is not None:
-            t_range = tuple(args.t_range)
-            print(f"Processing timepoint range: {t_range[0]} to {t_range[1]}")
+            print(f"Processing specific timepoints: {args.t_list}")
         else:
             print("Processing all timepoints")
         
@@ -590,21 +641,26 @@ if __name__ == "__main__":
         print(f"Loading model from {args.model}")
         model = CellposeModel(gpu=args.gpu, pretrained_model=args.model)
         
+        cellpose_config = {
+            'diameter': args.diameter,
+        }
+
         # Run segmentation
-        all_masks = segment_timelapse_3views(
-            video_path=args.video,
-            output_dir=args.output,
+        all_masks = batch_tif_segment_timelapse_3views(
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+            file_index=args.file_index,
             model=model,
             tile_size=tuple(args.tile_size),
             overlap_xy=args.overlap,
             gamma=args.gamma,
-            t_range=t_range,
+            t_list=args.t_list,
+            cellpose_config_dict=cellpose_config,
             normalize=not args.no_normalize,
-            verbose=not args.quiet
+            verbose=args.verbose
         )
         
         print(f"\nSegmentation complete!")
-        print(f"Output shape: {all_masks.shape}")
-        print(f"Results saved to: {args.output}")
+
 
     

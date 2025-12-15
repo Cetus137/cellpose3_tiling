@@ -1,0 +1,81 @@
+# Snakefile for merge workflow
+# Process timepoints in parallel and combine results
+
+import os
+
+# Configuration
+INPUT_FILE = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop2/segmentation200/video/combined_timelapse_1.00_masks.tif"
+OUTPUT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop2/segmentation200/merged"
+INTERFACE_THRESHOLD = 0.10
+N_TIMEPOINTS = 65
+SCRIPT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+
+# Rule to define the final output
+rule all:
+    input:
+        os.path.join(OUTPUT_DIR, "video", "combined_timelapse_merge.tif")
+
+# Rule to merge individual timepoints
+rule merge_timepoint:
+    input:
+        INPUT_FILE
+    output:
+        os.path.join(OUTPUT_DIR, "merge_threshold{threshold}_t{timepoint,\d+}.tif")
+    params:
+        threshold = lambda wildcards: wildcards.threshold,
+        timepoint = lambda wildcards: wildcards.timepoint
+    resources:
+        mem_mb = 64000,
+        runtime = 45,
+        cpus = 1,
+        slurm_extra = "'--exclude=compg009,compg010,compg011,compg013'"
+    log:
+        "slogs/merge_t{timepoint}_{threshold}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        module load CUDA/12.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+        
+        python3 -u {SCRIPT_DIR}/merge_seg.py \
+            --input {input} \
+            --output_dir {OUTPUT_DIR} \
+            --interface_threshold {params.threshold} \
+            --t_list {params.timepoint} \
+            --verbose &> {log}
+        """
+
+# Rule to combine all timepoints into a single video
+rule combine_timepoints:
+    input:
+        # Declare dependency on all merge outputs
+        expand(os.path.join(OUTPUT_DIR, "merge_threshold{threshold}_t{timepoint:04d}.tif"),
+               threshold=f"{INTERFACE_THRESHOLD:.2f}",
+               timepoint=range(N_TIMEPOINTS))
+    output:
+        os.path.join(OUTPUT_DIR, "video", "combined_timelapse_merge.tif")
+    params:
+        input_dir = OUTPUT_DIR,
+        phrase = "merge",
+        output_dir = os.path.join(OUTPUT_DIR, "video")
+    resources:
+        mem_mb = 128000,
+        runtime = 15,
+        cpus = 1
+    log:
+        "slogs/stack_combiner.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+        
+        python3 -u {SCRIPT_DIR}/stack_combiner.py \
+            --input_dir {params.input_dir} \
+            --phrase {params.phrase} \
+            --output_path {params.output_dir} \
+            --verbose &> {log}
+        """

@@ -325,7 +325,7 @@ def segment_large_image_3views(image, model, tile_size=(256, 256, 256), overlap_
         print("Computing final masks...")
     
     default_config = {
-        'mask_threshold': 6.0,
+        'mask_threshold': 8.0,
         'cluster': False,
     }
     config = {**default_config, **(omnipose_config_dict or {})}

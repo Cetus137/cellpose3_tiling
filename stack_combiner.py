@@ -179,6 +179,10 @@ def combine_timepoint_files(input_dir, output_path=None, phrase=None, verbose=Tr
         frame = tiff.imread(file_path)
         
         # Validate shape
+        if frame.ndim == 4 and frame.shape[0] == 1:
+            # Assume single T view stored as (1, Z, Y, X)
+            frame = frame[0, ...]
+
         if frame.ndim != 3:
             if verbose:
                 print(f"  Warning: Skipping {Path(file_path).name} - expected shape (Z, Y, X), got {frame.shape}")
@@ -233,16 +237,17 @@ if __name__ == "__main__":
     parser.add_argument("--input_dir"   , type=str              , help="Directory containing individual timepoint TIF files.")
     parser.add_argument("--output_path" , type=str, default=None, help="Path to save the combined video. Defaults to 'combined_timelapse.tif' in input_dir.")
     parser.add_argument("--phrase"      , type=str, default=None, help="Optional substring to filter filenames.")
-    parser.add_argument("--three_views" , type=bool, default=False  , help="Indicates that input files have 3 views (shape: 3,Z,Y,X).")
+    parser.add_argument("--three_views" , action="store_true" , help="Indicates that input files have 3 views (shape: 3,Z,Y,X).")
     parser.add_argument("--verbose"     , action="store_true"   , help="Print progress information.")
+    parser.add_argument("--dtype"       , type=str, default="int16", help="Data type for output video (e.g., 'int16', 'float32').")
     
     args = parser.parse_args()
-    
+    print()
     if args.three_views:
         #combine_timepoint_files_3views(args.input_dir, args.output_path, args.phrase, args.verbose)
         combine_timepoint_files_3views(args.input_dir, args.output_path, args.phrase, args.verbose)
     elif not args.three_views:
         #combine_timepoint_files(args.input_dir, args.output_path, args.phrase, args.verbose)
-        combine_timepoint_files(args.input_dir, args.output_path, args.phrase, args.verbose)
+        combine_timepoint_files(args.input_dir, args.output_path, args.phrase, args.verbose , dtype=args.dtype)
 
 
