@@ -112,6 +112,8 @@ def tile_image_3d_3views(image, tile_size=(256, 256, 256), overlap_xy=32):
                     'x_end': x_end,
                     'original_shape': (z_end - z_start, y_end - y_start, x_end - x_start)
                 })
+
+
     
     return tiles
 
@@ -509,6 +511,7 @@ def segment_timelapse_3views(video_path, output_dir, model, tile_size=(256, 256,
         print(f"Total timepoints processed: {n_timepoints}")
     
     return all_masks
+
 
 
 if __name__ == "__main__":

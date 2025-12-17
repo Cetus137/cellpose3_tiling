@@ -19,7 +19,9 @@ def segment_3D_stack(image_stack, config, view):
     model = config['model']
 
     if view == 'XY':
+        print('Segmenting view XY')
         for i in range(shape[0]):
+            print('Segmenting slice', i)
             image = image_stack[i, :, :]
             masks, flows, styles = model.eval(image, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'] , cellprob_threshold=config.get('cell_prob_threshold', 0.0),
                                               diameter=config.get('diameter', None) )
@@ -30,6 +32,7 @@ def segment_3D_stack(image_stack, config, view):
 
         tiff.imwrite('cellprob_xy_raw.tif', cell_prob_stack.astype(np.float32))
     elif view == 'XZ':
+        print('Segmenting view XZ')
         for i in range(shape[0]):
             image = image_stack[i, :, :]
             masks, flows, styles = model.eval(image, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0),
@@ -50,6 +53,7 @@ def segment_3D_stack(image_stack, config, view):
         tiff.imwrite('cellprob_xz_raw.tif', cell_prob_stack.astype(np.float32))
 
     elif view == 'YZ':
+        print('Segmenting view YZ')
         for i in range(shape[0]):
             image = image_stack[i, :, :]
             masks, flows, styles = model.eval(image, channels=[0, 0], batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0),
@@ -72,10 +76,9 @@ def segment_3D_stack(image_stack, config, view):
 
 
 def segment_3views(image_xy, image_xz, image_yz, config):
-
+    flowsx_xy, flowsy_xy, _, cell_prob_xy = segment_3D_stack(image_xy, config, view='XY')
     _, flowsy_yz, flowsz_yz, cell_prob_yz = segment_3D_stack(image_yz, config, view='YZ')
     flowsx_xz, _, flowsz_xz, cell_prob_xz = segment_3D_stack(image_xz, config, view='XZ')
-    flowsx_xy, flowsy_xy, _, cell_prob_xy = segment_3D_stack(image_xy, config, view='XY')
 
     #average the flows and cell probabilities from different views
     flowsx = (flowsx_xy + flowsx_xz)
@@ -104,7 +107,7 @@ def segment_zstack_3views(vid_frame_3views, model, cellpose_config_dict=None):
 
     default_config = {
         'model' : model,
-        'batch_size': 182,
+        'batch_size': 256,
         'do_3D': False,
         'diameter': None,
         'min_size': 100,
@@ -129,7 +132,6 @@ def segment_zstack_3views(vid_frame_3views, model, cellpose_config_dict=None):
     cell_prob_blur = np.clip(cell_prob_blur, -6, 12)
     dP_blur = ndi.gaussian_filter(dP, sigma=(0,2,2,2))
 
-    print('computing masks...')
     print(dP_blur.shape , cell_prob_blur.shape)
     return dP_blur , cell_prob_blur
 

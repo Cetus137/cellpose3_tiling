@@ -485,12 +485,12 @@ def segment_timelapse_3views(video_path, output_dir, model, tile_size=(256, 256,
     # Convert to numpy array
     all_masks = np.array(all_masks)
     
-    return all_masks
+    return dP_blur ,cell_prob_blur, all_masks
 
 def batch_tif_segment_timelapse_3views(input_dir, output_dir, model, file_index=None,
                                    tile_size=(256, 256, 256), overlap_xy=32, 
                                    cellpose_config_dict=None, normalize=True,
-                                   gamma=1.0, t_list=None, verbose=True, phrase='restored_timepoint'):
+                                   gamma=None, t_list=None, verbose=True, phrase='restored_timepoint'):
     """
     Batch process all .tif files in a directory for timelapse segmentation.
     
@@ -524,10 +524,13 @@ def batch_tif_segment_timelapse_3views(input_dir, output_dir, model, file_index=
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    tif_files = natsorted([f for f in os.listdir(input_dir) if f.lower().endswith('.tif')])
-    if verbose:
-        print(f"Found {len(tif_files)} .tif files in {input_dir}")
 
+    # Count all segmentation files in directory and subdirectories using os.walk
+    tif_files = []
+    for root, dirs, files in os.walk(input_dir):
+        for file in files:
+            if (file.endswith('.tif') or file.endswith('.tiff')) and 'tile' in file:
+                tif_files.append(os.path.join(root, file))
     if phrase is not None:
         tif_files = [f for f in tif_files if phrase in f]
         if verbose:
@@ -566,22 +569,74 @@ def batch_tif_segment_timelapse_3views(input_dir, output_dir, model, file_index=
 
     return 
 
+
+def batch_tile_segmentation_3views(input_dir, output_dir,model,file_index=None,
+                              tile_size=(256, 256, 256), overlap_xy=32, 
+                              cellpose_config_dict=None, normalize=True,
+                              gamma=None, verbose=True):
+    """
+    Batch process all .tif files in a directory for tiled segmentation.
+    
+    Parameters:
+    -----------
+    input_dir : str
+        Directory containing input .tif files
+    output_dir : str
+        Directory to save output files
+    model : CellposeModel
+        Cellpose model to use for segmentation
+    tile_size : tuple
+        Size of each tile (z, y, x). Default is (256, 256, 256)
+    overlap_xy : int
+        Overlap in pixels for XY dimensions. Default is 32
+    cellpose_config_dict : dict
+        Dictionary of cellpose configuration parameters
+    normalize : bool
+        Whether to normalize the video to range 0-1. Default is True
+    """
+    import os
+    from pathlib import Path
+    from natsort import natsorted
+    
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Count all segmentation files in directory and subdirectories using os.walk
+    tif_files = []
+    for root, dirs, files in os.walk(input_dir):
+        for file in files:
+            if (file.endswith('.tif') or file.endswith('.tiff')) and 'tile' in file:
+                tif_files.append(os.path.join(root, file))
+
+    if file_index is not None:
+        if file_index < 0 or file_index >= len(tif_files):
+            raise ValueError(f"file_index {file_index} is out of range. Found {len(tif_files)} .tif files.")
+        tif_files = [tif_files[file_index]]
+        if verbose:
+            print(f"Processing only file at index {file_index}: {tif_files[0]}")
+
+    for tif_file in tif_files:
+        input_path  = input_dir  / tif_file
+        if verbose:
+            print(f"\nProcessing file: {tif_file}")
+        
+        image = tiff.imread(str(input_path))
+
+        dP_blur, cell_prob_blur = segment_zstack_3views(image, model, cellpose_config_dict)
+
+        #save the outputs accordingly
+        output_dP_path = output_dir / tif_file.replace('.tif', '_dP_blur.tif')
+        output_cellprob_path = output_dir / tif_file.replace('.tif', '_cellprob_blur.tif')
+
+        tiff.imwrite(str(output_dP_path), dP_blur.astype(np.float32))
+        tiff.imwrite(str(output_cellprob_path), cell_prob_blur.astype(np.float32))
+
+    return 
+
+
 if __name__ == "__main__":
     import argparse
-    
-    try:
-        version = getattr(cellpose, '__version__', None)
-        if not version:
-            try:
-                version = _getv('cellpose')
-            except Exception:
-                try:
-                    version = pkg_resources.get_distribution('cellpose').version
-                except Exception:
-                    version = 'unknown'
-        print('Cellpose version:', version)
-    except Exception as e:
-        print('Could not determine Cellpose version:', e)
 
     # Set up command-line argument parser
     parser = argparse.ArgumentParser(
@@ -617,12 +672,14 @@ if __name__ == "__main__":
                        help='Specific timepoints to process. E.g., --t_list 0 5 10 15. If not provided, all timepoints are processed.')
     parser.add_argument('--no_normalize', action='store_true',
                        help='Skip normalization to [0, 1] range')
-    parser.add_argument('--gpu', action='store_true', default=True,
+    parser.add_argument('--gpu', action='store_true', default=False,
                        help='Use GPU (default: True)')
     parser.add_argument('--verbose', action='store_true',
                        help='Enable verbose output')
     parser.add_argument('--diameter', type=float, default=None,
                        help='Cell diameter for Cellpose model (default: None)')
+    parser.add_argument('--cellprob_threshold', type=float, default=0.0,
+                       help='Cell probability threshold for Cellpose (default: 0.0)')
     
     args = parser.parse_args()
     
@@ -643,6 +700,8 @@ if __name__ == "__main__":
         
         cellpose_config = {
             'diameter': args.diameter,
+            'cell_prob_threshold': args.cellprob_threshold,
+            'use_gpu': args.gpu
         }
 
         # Run segmentation

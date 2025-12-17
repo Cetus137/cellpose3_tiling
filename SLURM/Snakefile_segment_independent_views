@@ -1,0 +1,128 @@
+# Snakefile for segmentation workflow
+# Process individual timepoint files in parallel from input directory
+
+import os
+from pathlib import Path
+import glob
+
+# Configuration
+INPUT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop1/restored_views"
+OUTPUT_DIR_VIEWS = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop1/segmentation/cellpose/views"
+OUTPUT_DIR_COMBINED = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop1/segmentation/cellpose/combined"
+MODEL_PATH = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/SLURM/models/cp3_addnoise_model"
+SCRIPT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+
+# Segmentation parameters
+GAMMA = 1.0
+TILE_SIZE = [288, 288, 288]  # Z, Y, X
+OVERLAP = 32
+CELLPROB_THRESHOLD = 2.0
+
+# Get list of all input files
+input_files = sorted(glob.glob(os.path.join(INPUT_DIR, "restored_timepoint_*.tif")))
+
+# Extract base filenames (without extension)
+file_basenames = [os.path.splitext(os.path.basename(f))[0] for f in input_files]
+
+# Extract unique timepoints from filenames
+timepoints = []
+for f in input_files:
+    basename = os.path.basename(f)
+    # Extract number from "restored_timepoint_XXXX_view.tif"
+    tp = basename.replace("restored_timepoint_", "").split("_")[0]
+    if int(tp) not in timepoints:
+        timepoints.append(int(tp))
+
+timepoints = sorted(timepoints)
+
+print(f"Found {len(input_files)} files to process")
+print(f"Found {len(timepoints)} unique timepoints")
+
+# Rule to define the final outputs
+rule all:
+    input:
+        # Final combined segmentation files (one per timepoint)
+        expand(os.path.join(OUTPUT_DIR_COMBINED, "restored_timepoint_{timepoint:04d}_segmented.tif"),
+               timepoint=timepoints)
+
+# Rule to extract flows and cellprob for individual file
+rule extract_flows_file:
+    input:
+        os.path.join(INPUT_DIR, "{basename}.tif")
+    output:
+        flows = os.path.join(OUTPUT_DIR_VIEWS, "{basename}_flows_gamma{gamma}.tif"),
+        cellprob = os.path.join(OUTPUT_DIR_VIEWS, "{basename}_cellprob_gamma{gamma}.tif")
+    params:
+        file_index = lambda wildcards: file_basenames.index(wildcards.basename),
+        gamma = GAMMA
+    resources:
+        mem_mb = 12000,
+        runtime = 15,
+        cpus = 1,
+        slurm_partition = "gpu_short",
+        slurm_extra = "--gres=gpu:1 --exclude=compg009,compg010,compg011,compg013" ,
+        #slurm_extra = "--exclude=compg009,compg010,compg011,compg013"
+    log:
+        "slogs/flows_{basename}_gamma{gamma}.log"
+    shell:
+        """
+        export TMPDIR=/well/kir-fritzsche/users/aif490/tmp
+        mkdir -p $TMPDIR
+        
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        module load CUDA/12.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+        
+        python3 -u {SCRIPT_DIR}/tiled_segmentation_1view.py \
+            --input_dir {INPUT_DIR} \
+            --output_dir {OUTPUT_DIR_VIEWS} \
+            --model {MODEL_PATH} \
+            --gamma {GAMMA} \
+            --tile_size {TILE_SIZE[0]} {TILE_SIZE[1]} {TILE_SIZE[2]} \
+            --overlap {OVERLAP} \
+            --file_index {params.file_index} \
+            --cellprob_threshold {CELLPROB_THRESHOLD} \
+            --verbose &> {log}
+        """
+
+# Rule to reconstruct masks from flows and cellprob for each timepoint
+rule reconstruct_masks_timepoint:
+    input:
+        # All 6 files needed: 3 flows + 3 cellprob for xy, xz, yz views
+        flows_xy    = os.path.join(OUTPUT_DIR_VIEWS, f"restored_timepoint_{{timepoint,\\d{{4}}}}_view_xy_flows_gamma{GAMMA:.2f}.tif"),
+        flows_xz    = os.path.join(OUTPUT_DIR_VIEWS, f"restored_timepoint_{{timepoint,\\d{{4}}}}_view_xz_flows_gamma{GAMMA:.2f}.tif"),
+        flows_yz    = os.path.join(OUTPUT_DIR_VIEWS, f"restored_timepoint_{{timepoint,\\d{{4}}}}_view_yz_flows_gamma{GAMMA:.2f}.tif"),
+        cellprob_xy = os.path.join(OUTPUT_DIR_VIEWS, f"restored_timepoint_{{timepoint,\\d{{4}}}}_view_xy_cellprob_gamma{GAMMA:.2f}.tif"),
+        cellprob_xz = os.path.join(OUTPUT_DIR_VIEWS, f"restored_timepoint_{{timepoint,\\d{{4}}}}_view_xz_cellprob_gamma{GAMMA:.2f}.tif"),
+        cellprob_yz = os.path.join(OUTPUT_DIR_VIEWS, f"restored_timepoint_{{timepoint,\\d{{4}}}}_view_yz_cellprob_gamma{GAMMA:.2f}.tif")
+    output:
+        os.path.join(OUTPUT_DIR_COMBINED, "restored_timepoint_{timepoint,\d{4}}_segmented.tif")
+    params:
+        timepoint = lambda wildcards: int(wildcards.timepoint)
+    resources:
+        mem_mb = 128000,
+        runtime = 120,
+        cpus = 1
+    log:
+        "slogs/reconstruct_timepoint_{timepoint}.log"
+    shell:
+        """
+        export TMPDIR=/well/kir-fritzsche/users/aif490/tmp
+        mkdir -p $TMPDIR
+        
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+        
+        python3 -u {SCRIPT_DIR}/mask_reconstruction.py \
+            --seg_dir {OUTPUT_DIR_VIEWS} \
+            --output_dir {OUTPUT_DIR_COMBINED} \
+            --timepoint {params.timepoint} \
+            --flow_threshold 0.4 \
+            --min_size 5000 \
+            --do_3D \
+            --cellprob_threshold 0.0 &> {log}
+        """

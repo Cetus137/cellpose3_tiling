@@ -59,7 +59,6 @@ def segment_3D_stack(image_stack, config, view):
             flowsy_stack[i, :, :] = flows[1][0]
             cell_prob_stack[i, :, :] = flows[2]
 
-        tiff.imwrite('cellprob_xy_raw.tif', cell_prob_stack.astype(np.float32))
 
     elif view == 'XZ':
         for i in range(shape[0]):
@@ -118,6 +117,13 @@ def segment_3views(image_xy, image_xz, image_yz, config):
     print(cell_prob.shape)
     return dP, cell_prob
 
+
+
+def segment_1view(image , config):
+    flowsx_stack, flowsy_stack, _, cell_prob_stack = segment_3D_stack(image, config, view='XY')
+    dP = np.array([ flowsy_stack, flowsx_stack])
+    return dP , cell_prob_stack
+
 def segment_zstack(vid_frame, model, cellpose_config_dict=None):
     '''
     segment a single timepoint 3D frame with cellpose.
@@ -134,7 +140,7 @@ def segment_zstack(vid_frame, model, cellpose_config_dict=None):
 
     default_config = {
         'model' : model,
-        'batch_size': 182,
+        'batch_size':256,
         'do_3D': False,
         'diameter': None,
         'min_size': 100,
