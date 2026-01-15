@@ -5,10 +5,10 @@ import os
 import glob
 
 # Configuration
-INPUT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop3/segmentation"
-WATERSHED_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop3/watershed"
-MERGE_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop3/merged"
-SCRIPT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+INPUT_DIR =     "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/segmentation/cellpose/reconstructed"
+WATERSHED_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/segmentation/cellpose/ws"
+MERGE_DIR =     "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/segmentation/cellpose/merge"
+SCRIPT_DIR =    "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
 
 # Watershed parameters
 MIN_DISTANCE = 5
@@ -16,7 +16,7 @@ SIGMA = 1.0
 NUM_PEAKS = 2
 
 # Merge parameters
-INTERFACE_THRESHOLD = 0.10
+INTERFACE_THRESHOLD = 0.20  # Changed from 0.10 to 0.20
 
 # Get list of input files and determine number of timepoints
 input_files = sorted(glob.glob(os.path.join(INPUT_DIR, "restored_timepoint_*_segmented.tif")))
@@ -35,9 +35,9 @@ rule all:
     input:
         expand(os.path.join(WATERSHED_DIR, "restored_timepoint_{timepoint:04d}_segmented_ws.tif"),
                timepoint=timepoints),
-        expand(os.path.join(MERGE_DIR, "restored_timepoint_{timepoint:04d}_segmented_merged_thresh{threshold:.2f}.tif"),
+        expand(os.path.join(MERGE_DIR, "restored_timepoint_{timepoint:04d}_segmented_merged_thresh{threshold}.tif"),
                timepoint=timepoints,
-               threshold=INTERFACE_THRESHOLD)
+               threshold=f"{INTERFACE_THRESHOLD:.2f}")
 
 # Rule to apply watershed to individual timepoint files
 rule watershed_timepoint:
@@ -77,17 +77,17 @@ rule merge_timepoint:
     input:
         os.path.join(INPUT_DIR, "restored_timepoint_{timepoint,\d{4}}_segmented.tif")
     output:
-        os.path.join(MERGE_DIR, "restored_timepoint_{timepoint,\d{4}}_segmented_merged_thresh{threshold}.tif")
+        os.path.join(MERGE_DIR, "restored_timepoint_{timepoint,\d{4}}_segmented_merged_thresh" + f"{INTERFACE_THRESHOLD:.2f}" + ".tif")
     params:
         threshold = INTERFACE_THRESHOLD,
         file_index = lambda wildcards: timepoints.index(int(wildcards.timepoint))
     resources:
         mem_mb = 64000,
-        runtime = 45,
+        runtime = 60,
         cpus = 1,
         slurm_extra = '--exclude=compg009,compg010,compg011,compg013'
     log:
-        "slogs/merge_timepoint_{timepoint}_thresh{threshold}.log"
+        "slogs/merge_timepoint_{timepoint}_thresh" + f"{INTERFACE_THRESHOLD:.2f}" + ".log"
     shell:
         """
         module purge

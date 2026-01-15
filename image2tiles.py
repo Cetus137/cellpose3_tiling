@@ -28,6 +28,21 @@ def tile_image_3d_3views(image, tile_size=(256, 256, 256), overlap_xy=32):
             - 'y_start', 'y_end': y coordinates  
             - 'x_start', 'x_end': x coordinates
     """
+
+    image_shape = image.shape
+    print("Input image shape:", image_shape)
+
+    #squeeze singleton dimensions
+    image = np.squeeze(image)
+
+    print("Squeezed image shape:", image.shape)
+
+    if len(image.shape) == 3:
+        # duplicate the image 3 times in the first dimension to simulate 3 views
+        print("Duplicating image to have 3 views")
+        image = np.stack([image, image, image], axis=0)  # shape now (3, z, y, x)
+
+    
     views, z_size, y_size, x_size = image.shape
     tile_z, tile_y, tile_x = tile_size
     

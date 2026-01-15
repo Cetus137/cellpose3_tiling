@@ -3,6 +3,7 @@ from cellpose.dynamics import compute_masks
 import tifffile as tiff
 import os
 
+
 def reconstruct_from_tiles_3views(tiles, image_shape, overlap_xy=32):
     """
     Reconstruct dP_blur and cell_prob_blur from segmented tiles by averaging overlaps.
@@ -31,8 +32,13 @@ def reconstruct_from_tiles_3views(tiles, image_shape, overlap_xy=32):
     
     dP_weights = np.zeros((3, z_size, y_size, x_size), dtype=np.float32)
     cell_prob_weights = np.zeros((z_size, y_size, x_size), dtype=np.float32)
-    
+    tile_id = 1
     for tile_info in tiles:
+
+        print('processing tile number', tile_id)
+        tile_id += 1
+
+
         z_start = tile_info['z_start']
         z_end = tile_info['z_end']
         y_start = tile_info['y_start']
@@ -42,17 +48,20 @@ def reconstruct_from_tiles_3views(tiles, image_shape, overlap_xy=32):
         
         # Get actual data size (not padded)
         actual_z, actual_y, actual_x = tile_info['original_shape']
-        
+        print('original shape:', tile_info['original_shape'])
+
         tile_dP = tile_info['dP_blur'][:, :actual_z, :actual_y, :actual_x]
         tile_cell_prob = tile_info['cell_prob_blur'][:actual_z, :actual_y, :actual_x]
         
         # Create weight map for this tile (1.0 in center, tapering at edges in overlap regions)
+        print('creating weight map...')
         weight_map = create_weight_map(
             (actual_z, actual_y, actual_x),
             overlap_xy,
             z_start, z_end, y_start, y_end, x_start, x_end,
             image_shape
         )
+        print('weight map shape:', weight_map.shape)
         
         # Accumulate weighted values
         dP_blur[:, z_start:z_end, y_start:y_end, x_start:x_end] += tile_dP * weight_map
@@ -161,9 +170,9 @@ def timepoint_reconstruct_dP_cellprob(tile_dir, timepoint, overlap_xy=32):
     # Find all tif files in the directory
     tif_files = [f for f in os.listdir(tile_dir) if f.endswith('.tif')]
     tif_files = natsorted(tif_files)
-    
+    print('timepoint is ', timepoint)
     # Find the specific timepoint files
-    flow_files     = [f for f in tif_files if f"timepoint_{timepoint:04d}" in f and "flows"    in f]
+    flow_files     = [f for f in tif_files if f"timepoint_{timepoint:04d}" in f and "dP"    in f]
     cellprob_files = [f for f in tif_files if f"timepoint_{timepoint:04d}" in f and "cellprob" in f]
     
     if len(flow_files) == 0:
@@ -175,25 +184,31 @@ def timepoint_reconstruct_dP_cellprob(tile_dir, timepoint, overlap_xy=32):
     max_z, max_y, max_x = 0, 0, 0
     
     # Build tile info and determine image shape
+    import re
     for flow_file, cellprob_file in zip(flow_files, cellprob_files):
-        # Extract tile metadata from filename
-        parts = flow_file.split('_')
-        z_start = int(parts[parts.index('zstart') + 1])
-        z_end   = int(parts[parts.index('zend')   + 1])
-        y_start = int(parts[parts.index('ystart') + 1])
-        y_end   = int(parts[parts.index('yend')   + 1])
-        x_start = int(parts[parts.index('xstart') + 1])
-        x_end   = int(parts[parts.index('xend')   + 1])
-        
+        # Extract tile metadata from filename using regex
+        # Example: ..._z0-256_y0-256_x224-480_...
+        m_z = re.search(r'_z(\d+)-(\d+)', flow_file)
+        m_y = re.search(r'_y(\d+)-(\d+)', flow_file)
+        m_x = re.search(r'_x(\d+)-(\d+)', flow_file)
+        if not (m_z and m_y and m_x):
+            print(f"Warning: Could not parse tile coordinates from {flow_file}, skipping.")
+            continue
+        z_start, z_end = int(m_z.group(1)), int(m_z.group(2))
+        y_start, y_end = int(m_y.group(1)), int(m_y.group(2))
+        x_start, x_end = int(m_x.group(1)), int(m_x.group(2))
+
+        print(f"Found tile: z({z_start}-{z_end}), y({y_start}-{y_end}), x({x_start}-{x_end})")
+
         # Track maximum extents to determine image shape
         max_z = max(max_z, z_end)
         max_y = max(max_y, y_end)
         max_x = max(max_x, x_end)
-        
+
         # Load the actual data
         flow_data = tiff.imread(os.path.join(tile_dir, flow_file))
         cellprob_data = tiff.imread(os.path.join(tile_dir, cellprob_file))
-        
+
         tiles.append({
             'dP_blur': flow_data,
             'cell_prob_blur': cellprob_data,
@@ -216,28 +231,31 @@ def timepoint_reconstruct_dP_cellprob(tile_dir, timepoint, overlap_xy=32):
 
 
 def reconstruct_masks_from_tiles(tile_dir, output_dir, timepoint, overlap_xy=32,
-                                 cellpose_config_dict=None, verbose=True):
+                                 min_size=5000, diameter=None, cellprob_threshold=0.0, do_3D=True, verbose=True):
+    dP, cellprob = timepoint_reconstruct_dP_cellprob(
+        tile_dir, timepoint, overlap_xy
+    )
+    if verbose:
+        print(f"Reconstructed dP shape: {dP.shape}, cellprob shape: {cellprob.shape}")
+    
+    # Compute masks from reconstructed dP and cellprob
 
-        dP, cellprob = timepoint_reconstruct_dP_cellprob(
-            tile_dir, timepoint, overlap_xy
-        )
+    if verbose:
+        print("Computing masks from reconstructed dP and cellprob...")
+    masks = compute_masks(dP,
+                         cellprob,
+                         min_size=min_size,
+                         do_3D=do_3D,
+                         cellprob_threshold=cellprob_threshold)
+    if verbose:
+        print(f"Reconstructed masks for timepoint {timepoint} with shape {masks.shape}")
+        print(f"Unique labels in masks: {np.unique(masks)}")
 
-
-        masks = compute_masks(dP, 
-                             cellprob, 
-                             flow_threshold=cellpose_config_dict.get('flow_threshold', 0.4), 
-                             min_size=cellpose_config_dict.get('min_size', 15), 
-                             do_3D=cellpose_config_dict.get('do_3D', True), 
-                             cellprob_threshold=cellpose_config_dict.get('cellprob_threshold', 0.0))
-        if verbose:
-            print(f"Reconstructed masks for timepoint {timepoint} with shape {masks.shape}")
-            print(f"Unique labels in masks: {np.unique(masks)}")
-            
-        # Save masks
-        output_path = os.path.join(output_dir, f'restored_timepoint_{timepoint:04d}_segmented.tif')
-        print(f"Saving masks to {output_path}")
-        tiff.imwrite(output_path, masks.astype(np.uint16))
-        return
+    # Save masks
+    output_path = os.path.join(output_dir, f'restored_timepoint_{timepoint:04d}_segmented.tif')
+    print(f"Saving masks to {output_path}")
+    tiff.imwrite(output_path, masks.astype(np.uint16))
+    return
 
 
 def main():
@@ -247,7 +265,8 @@ def main():
     import argparse
     import tifffile as tiff
     import os
-    
+    import distutils.util
+
     parser = argparse.ArgumentParser(description='Reconstruct images from tiled flow and cellprob outputs')
     parser.add_argument('--tile_dir', type=str, required=True,
                         help='Directory containing the tile files')
@@ -257,35 +276,40 @@ def main():
                         help='Timepoint number to reconstruct')
     parser.add_argument('--overlap', type=int, default=32,
                         help='Overlap in pixels used during tiling (default: 32)')
-    parser.add_argument('--save_flows', action='store_true',
-                        help='Save reconstructed flow field')
-    parser.add_argument('--save_cellprob', action='store_true',
-                        help='Save reconstructed cellprob')
-    
+    parser.add_argument('--min_size', type=int, default=5000,
+                        help='Minimum size of objects to keep (default: 5000)')
+    parser.add_argument('--diameter', type=str, default="None",
+                        help='Cell diameter for Cellpose model (default: None)')
+    parser.add_argument('--cellprob_threshold', type=float, default=0.0,
+                        help='Cell probability threshold for segmentation (default: 0.0)')
+    parser.add_argument('--do_3D', type=str, default="True",
+                        help='Whether to perform 3D segmentation (True/False)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Enable verbose output')
+
     args = parser.parse_args()
-    
+
     # Create output directory if needed
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Reconstruct
-    dP_blur, cell_prob_blur, image_shape = timepoint_reconstruct_dP_cellprob(
-        args.tile_dir, 
-        args.timepoint, 
-        args.overlap
+
+    # Convert diameter
+    diameter = None if args.diameter == "None" else float(args.diameter)
+    # Convert do_3D
+    import distutils.util
+    do_3D = bool(distutils.util.strtobool(args.do_3D))
+
+    reconstruct_masks_from_tiles(
+        tile_dir=args.tile_dir,
+        output_dir=args.output_dir,
+        timepoint=args.timepoint,
+        overlap_xy=args.overlap,
+        min_size=args.min_size,
+        diameter=diameter,
+        cellprob_threshold=args.cellprob_threshold,
+        do_3D=do_3D,
+        verbose=args.verbose
     )
-    
-    # Save outputs
-    if args.save_flows:
-        flow_path = os.path.join(args.output_dir, f"timepoint_{args.timepoint:04d}_flows.tif")
-        tiff.imwrite(flow_path, dP_blur.astype(np.float32))
-        print(f"Saved flows to {flow_path}")
-    
-    if args.save_cellprob:
-        cellprob_path = os.path.join(args.output_dir, f"timepoint_{args.timepoint:04d}_cellprob.tif")
-        tiff.imwrite(cellprob_path, cell_prob_blur.astype(np.float32))
-        print(f"Saved cellprob to {cellprob_path}")
-    
-    print(f"Reconstruction complete. Image shape: {image_shape}")
+    print(f"Reconstruction complete.")
 
 
 if __name__ == "__main__":

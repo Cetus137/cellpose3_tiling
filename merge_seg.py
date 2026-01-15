@@ -132,8 +132,12 @@ def merge_touching_pairs_3d(masks: np.ndarray,
     final_labels = final_labels[final_labels > 0]
 
     relabeled = np.zeros_like(result, dtype=np.uint16)
+    count = 0
     for new_label, old_label in enumerate(final_labels, start=1):
+        if count % 100 == 0 and verbose:
+            print("percent done:", new_label / len(final_labels) * 100)
         relabeled[result == old_label] = new_label
+        count += 1
 
     if verbose:
         print(f"\nFinal: {len(final_labels)} labels after merging")
