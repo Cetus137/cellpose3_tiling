@@ -7,24 +7,24 @@ import glob
 import re
 
 # Configuration
-INPUT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/restored"
-OUTPUT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/segmentation/cellpose/tiles"
-OUTPUT_DIR_RECONSTRUCTED = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/segmentation/cellpose/reconstructed"
-MODEL_PATH = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/SLURM/models/cp3_addnoise_model"
+INPUT_DIR  = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2validate/crop1_ordered/lifeact_restored"  # Directory containing input tile files
+OUTPUT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2validate/crop1_ordered/lifeact_restored_segmented"
+OUTPUT_DIR_RECONSTRUCTED = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2validate/crop1_ordered/lifeact_restored_segmented/reconstructed"
+MODEL_PATH = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/models/CP_20250430_181517"
 SCRIPT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
 
 # Segmentation parameters
 GAMMA = 1.0
 TILE_SIZE = [256, 288, 288]  # Z, Y, X
 OVERLAP = 32
-CELLPROB_THRESHOLD = 2.0
+CELLPROB_THRESHOLD = 4.0
 
 CELLPOSE_CONFIG_DICT = {
     'model_path': MODEL_PATH,
     'cellprob_threshold': CELLPROB_THRESHOLD,
     'do_3D': True,
     'min_size': 5000,
-    'diameter': None
+    'diameter': None  # Will be overridden by DIAMETERS list
 }
 
 # Count all segmentation files in directory and subdirectories using os.walk
@@ -64,7 +64,7 @@ N_TIMEPOINTS = len(timepoints)
 rule all:
     input:
         expand(os.path.join(OUTPUT_DIR_RECONSTRUCTED, "restored_timepoint_{timepoint:04d}_segmented.tif"),
-               timepoint=timepoints )  # Adjust range as needed
+               timepoint=timepoints)
 # Rule to segment individual tile files
 rule segment_tiles:
     input:
@@ -81,7 +81,7 @@ rule segment_tiles:
         slurm_partition = "short",
         slurm_extra = "--exclude=compg009,compg010,compg011,compg013"
     log:
-        "slogs/segment_{basename}.log"
+        "slogs/segmentation/segment_{basename}.log"
     shell:
         """
         export TMPDIR=/well/kir-fritzsche/users/aif490/tmp
@@ -122,12 +122,11 @@ rule reconstruct_from_tiles:
     params:
         timepoint = lambda wildcards: int(wildcards.timepoint),
         min_size = CELLPOSE_CONFIG_DICT['min_size'],
-        diameter = CELLPOSE_CONFIG_DICT['diameter'],
         cellprob_threshold = CELLPOSE_CONFIG_DICT['cellprob_threshold'],
         do_3D = CELLPOSE_CONFIG_DICT['do_3D']
     resources:
-        mem_mb = 198000,
-        runtime = 90,
+        mem_mb = 100000,
+        runtime = 45,
         cpus = 1,
         slurm_partition = "short",
         slurm_extra = "--exclude=compg009,compg010,compg011,compg013"
@@ -150,7 +149,6 @@ rule reconstruct_from_tiles:
             --timepoint {params.timepoint} \
             --overlap {OVERLAP} \
             --min_size {params.min_size} \
-            --diameter {params.diameter} \
             --cellprob_threshold {params.cellprob_threshold} \
             --do_3D {params.do_3D} \
             --verbose &> {log}

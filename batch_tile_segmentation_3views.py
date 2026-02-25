@@ -60,6 +60,17 @@ def batch_tile_segment_3views(input_dir, output_dir,model,file_index=None,
         
         image = tiff.imread(str(input_path))
 
+        #first squeeze any singleton dimensions
+        image = np.squeeze(image)
+
+        if image.shape[0] != 3:
+            print(f"Warning: Expected 3 views in first dimension, but got {image.shape}")
+
+        if image.ndim != 4:
+            print(f"Warning: Expected 4D image (views, z, y, x), but got shape {image.shape}.")
+            print("duplicating in the first dimension to create 3 views.")
+            image = np.stack([image]*3, axis=0)
+
         # Normalize if requested
         if normalize:
             if verbose:

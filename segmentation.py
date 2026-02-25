@@ -30,7 +30,7 @@ def batch_2D_images(input_dir, output_dir, config, model_path):
 
         masks, flows, styles = model.eval(image, diameter=None, channels=[0, 0],
                                          batch_size=config['batch_size'], do_3D=False,
-                                         min_size=config['min_size'])
+                                         min_size=config['min_size'] , cellprob_threshold=config['cellprob_threshold'])
 
         # Save masks
         output_path = output_dir / f"{file_path.stem}_masks.tif"
@@ -186,11 +186,11 @@ if __name__ == "__main__":
 
     config = {
         'batch_size': 1,
-        'min_size': 100, # to be set later
+        'min_size': 10, # to be set later
+        'cellprob_threshold': 0.0, # to be set later
     }
 
-    pretrained_model_path = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/models/CP_20250430_181517'
-    input_dir             = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/CARE/cycleCARE/data/node2_z85_z89_256'
-    output_dir            = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/node2_z85_z89_segmented'
-
+    pretrained_model_path = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/SLURM/models/cp3_addnoise_model_node2'
+    input_dir             = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/cellpose/new_network/data/node2_tiles'
+    output_dir            = r'/users/kir-fritzsche/aif490/devel/tissue_analysis/cellpose/new_network/data/node2_tiles_seg'
     batch_2D_images(input_dir, output_dir, config, pretrained_model_path)
