@@ -14,17 +14,17 @@ module load Python/3.10.8-GCCcore-12.2.0
 source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
 
 # Input/Output directories - MODIFY THESE FOR YOUR DATA
-TILE_DIR="/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop2/segmented/tiles_magnitude"
-OUTPUT_DIR="/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop2/segmented/flows_reconstructed"
+TILE_DIR="/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop4/tiles_restored"
+OUTPUT_DIR="/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop4/tiles_restored/reconstructed"
 SCRIPT_DIR="/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
 
 # Reconstruction parameters
 OVERLAP=32
 PATTERN="*_tile_*.tif"
-MARKER="cellprob"
+MARKER="timepoint_0000"
 
 echo "Reconstructing tiles from: ${TILE_DIR}"
-echo "Output directory: ${OUTPUT_DIR}"
+echo "Output directory: ${OUTPUT_DIR}"im
 echo "Overlap: ${OVERLAP}"
 echo "Pattern: ${PATTERN}"
 echo "Marker: ${MARKER}"

@@ -187,16 +187,24 @@ def timepoint_reconstruct_dP_cellprob(tile_dir, timepoint, overlap_xy=32):
     import re
     for flow_file, cellprob_file in zip(flow_files, cellprob_files):
         # Extract tile metadata from filename using regex
-        # Example: ..._z0-256_y0-256_x224-480_...
-        m_z = re.search(r'_z(\d+)-(\d+)', flow_file)
-        m_y = re.search(r'_y(\d+)-(\d+)', flow_file)
-        m_x = re.search(r'_x(\d+)-(\d+)', flow_file)
-        if not (m_z and m_y and m_x):
+        # Filenames have TWO sets of coordinates:
+        # 1. Crop coordinates: z53-309_y0-2048_x528-1552 (region from full volume)
+        # 2. Tile coordinates: tile_0000_z0-256_y0-256_x0-256 (individual tile)
+        # We need the TILE coordinates (after "tile_XXXX_")
+        
+        # Find all coordinate matches
+        all_z = re.findall(r'_z(\d+)-(\d+)', flow_file)
+        all_y = re.findall(r'_y(\d+)-(\d+)', flow_file)
+        all_x = re.findall(r'_x(\d+)-(\d+)', flow_file)
+        
+        if len(all_z) < 1 or len(all_y) < 1 or len(all_x) < 1:
             print(f"Warning: Could not parse tile coordinates from {flow_file}, skipping.")
             continue
-        z_start, z_end = int(m_z.group(1)), int(m_z.group(2))
-        y_start, y_end = int(m_y.group(1)), int(m_y.group(2))
-        x_start, x_end = int(m_x.group(1)), int(m_x.group(2))
+        
+        # Use the LAST match (tile coordinates, not crop coordinates)
+        z_start, z_end = int(all_z[-1][0]), int(all_z[-1][1])
+        y_start, y_end = int(all_y[-1][0]), int(all_y[-1][1])
+        x_start, x_end = int(all_x[-1][0]), int(all_x[-1][1])
 
         print(f"Found tile: z({z_start}-{z_end}), y({y_start}-{y_end}), x({x_start}-{x_end})")
 

@@ -6,7 +6,7 @@ from pathlib import Path
 import glob
 import tifffile as tiff
 
-def tile_image_3d_3views(image, tile_size=(256, 256, 256), overlap_xy=32, timepoint=None):
+def tile_image_3d_3views(image, tile_size=(380, 256, 256), overlap_xy=32, timepoint=None):
     """
     Tile a 3D image into overlapping tiles.
     
@@ -95,7 +95,7 @@ def tile_image_3d_3views(image, tile_size=(256, 256, 256), overlap_xy=32, timepo
 
     return tiles
 
-def tile_save_directory(output_dir, input_dir=None, file_path=None, tile_size=(256, 256, 256), overlap=32, verbose=True , phrase =None):
+def tile_save_directory(output_dir, input_dir=None, file_path=None, tile_size=(380, 256, 256), overlap=32, verbose=True , phrase =None):
     """
     Tile a 3D image from the input directory, to the output directory.
     
@@ -161,104 +161,93 @@ def tile_save_directory(output_dir, input_dir=None, file_path=None, tile_size=(2
         input_file = input_files[0]
         basename = os.path.splitext(os.path.basename(input_file))[0]
     
-    # Load image
-    image = tiff.imread(input_file)
-    
-    if verbose:
-        print(f"Processing file: {input_file} with shape {image.shape}")
-    
-    # Check if this is a timelapse
-    # Common formats: (T, Z, Y, X), (T, C, Z, Y, X), (T, views, Z, Y, X)
-    is_timelapse = False
-    num_timepoints = 1
-    
-    # First squeeze singleton dimensions to simplify detection
-    original_shape = image.shape
-    squeezed_shape = np.squeeze(image).shape
-    
-    if verbose:
-        print(f"Squeezed shape for detection: {squeezed_shape}")
-    
-    # After squeezing, check if we have 4D data: (T, Z, Y, X)
-    if len(squeezed_shape) == 4:
-        # Heuristic: views typically = 1 or 3, time typically > 3
-        # If first dimension is not 1 or 3, likely timelapse
-        if squeezed_shape[0] > 3:
-            is_timelapse = True
-            num_timepoints = squeezed_shape[0]
-            print(f"Detected timelapse data with {num_timepoints} timepoints")
-            # Use squeezed image for processing
-            image = np.squeeze(image)
-        else:
-            print(f"Detected 4D data with {squeezed_shape[0]} views/slices (not timelapse)")
-    elif len(original_shape) == 5:
-        # 5D: likely (T, C, Z, Y, X) or (T, views, Z, Y, X)
-        # Check if second dimension is singleton (channel/view dimension)
-        if original_shape[1] == 1 and original_shape[0] > 3:
-            is_timelapse = True
-            num_timepoints = original_shape[0]
-            print(f"Detected 5D timelapse data with {num_timepoints} timepoints")
-            # Squeeze out the singleton dimension
-            image = np.squeeze(image)
-        else:
-            print(f"Detected 5D data (shape: {original_shape}) - treating as single volume")
-    
-    all_tiles = []
-    
-    if is_timelapse:
-        # Process each timepoint separately
-        for t in range(num_timepoints):
-            if verbose:
-                print(f"Processing timepoint {t+1}/{num_timepoints}")
-            
-            # Extract single timepoint
-            timepoint_image = image[t]
-            
-            # Tile this timepoint
-            tiles = tile_image_3d_3views(timepoint_image, tile_size=tile_size, overlap_xy=overlap, timepoint=t)
-            
-            # Save tiles for this timepoint
-            for i, tile in enumerate(tiles):
-                data = tile['data']
-                z_start = tile['z_start']
-                z_end = tile['z_end']
-                y_start = tile['y_start']
-                y_end = tile['y_end']
-                x_start = tile['x_start']
-                x_end = tile['x_end']
+    # Load image with metadata to detect channel axis
+    with tiff.TiffFile(input_file) as tif:
+        image = tif.asarray()
+        axes = tif.series[0].axes.upper() if tif.series else None
 
-                tile_filename = f"timepoint_{t:04d}_{basename}_tile_{i:04d}_z{z_start}-{z_end}_y{y_start}-{y_end}_x{x_start}-{x_end}.tif"
-                tile_path = os.path.join(output_dir, tile_filename)
-                tiff.imwrite(tile_path, data)
-            
-            all_tiles.extend(tiles)
-            
+    if verbose:
+        print(f"Processing file: {input_file} with shape {image.shape}, axes: {axes}")
+
+    # Split channels: use OME-TIFF axis labels when available; for 5D data without
+    # metadata fall back to TCZYX convention (channels at axis 1)
+    if axes and 'C' in axes:
+        c_axis = axes.index('C')
+        num_channels = image.shape[c_axis]
+        channel_images = [np.take(image, c, axis=c_axis) for c in range(num_channels)]
         if verbose:
-            print(f"Generated {len(all_tiles)} total tiles from {num_timepoints} timepoints")
+            print(f"Detected {num_channels} channel(s) at axis {c_axis} from metadata (axes: {axes})")
+    elif len(image.shape) == 5:
+        c_axis = 1
+        num_channels = image.shape[c_axis]
+        channel_images = [np.take(image, c, axis=c_axis) for c in range(num_channels)]
+        if verbose:
+            print(f"No channel metadata; 5D array — assuming TCZYX, {num_channels} channel(s) at axis 1")
     else:
-        # Process as a single 3D volume (no timelapse)
-        tiles = tile_image_3d_3views(image, tile_size=tile_size, overlap_xy=overlap)
-        
+        num_channels = 1
+        channel_images = [image]
+
+    all_tiles = []
+
+    for c_idx, ch_image in enumerate(channel_images):
+        if verbose and num_channels > 1:
+            print(f"Processing channel {c_idx + 1}/{num_channels}")
+
+        ch_suffix = f"_ch{c_idx}" if num_channels > 1 else ""
+
+        # Detect timelapse within this channel's data
+        original_shape = ch_image.shape
+        squeezed_shape = np.squeeze(ch_image).shape
+
         if verbose:
-            print(f"Generated {len(tiles)} tiles from the image")
+            print(f"Squeezed shape for detection: {squeezed_shape}")
 
-        # Save the tiles in the output directory
-        for i, tile in enumerate(tiles):
-            data = tile['data']
-            z_start = tile['z_start']
-            z_end = tile['z_end']
-            y_start = tile['y_start']
-            y_end = tile['y_end']
-            x_start = tile['x_start']
-            x_end = tile['x_end']
+        is_timelapse = False
+        num_timepoints = 1
 
-            tile_filename = f"{basename}_tile_{i:04d}_z{z_start}-{z_end}_y{y_start}-{y_end}_x{x_start}-{x_end}.tif"
-            tile_path = os.path.join(output_dir, tile_filename)
-            tiff.imwrite(tile_path, data)
-        
-        all_tiles = tiles
-    
-    # Process
+        if len(squeezed_shape) == 4:
+            if squeezed_shape[0] > 3:
+                is_timelapse = True
+                num_timepoints = squeezed_shape[0]
+                print(f"Detected timelapse data with {num_timepoints} timepoints")
+                ch_image = np.squeeze(ch_image)
+            else:
+                print(f"Detected 4D data with {squeezed_shape[0]} views/slices (not timelapse)")
+        elif len(original_shape) == 5:
+            if original_shape[1] == 1 and original_shape[0] > 3:
+                is_timelapse = True
+                num_timepoints = original_shape[0]
+                print(f"Detected 5D timelapse data with {num_timepoints} timepoints")
+                ch_image = np.squeeze(ch_image)
+            else:
+                print(f"Detected 5D data (shape: {original_shape}) - treating as single volume")
+
+        if is_timelapse:
+            for t in range(num_timepoints):
+                if verbose:
+                    print(f"Processing timepoint {t+1}/{num_timepoints}")
+                timepoint_image = ch_image[t]
+                tiles = tile_image_3d_3views(timepoint_image, tile_size=tile_size, overlap_xy=overlap, timepoint=t)
+                for i, tile in enumerate(tiles):
+                    z_start, z_end = tile['z_start'], tile['z_end']
+                    y_start, y_end = tile['y_start'], tile['y_end']
+                    x_start, x_end = tile['x_start'], tile['x_end']
+                    tile_filename = f"timepoint_{t:04d}_{basename}_tile_{i:04d}_z{z_start}-{z_end}_y{y_start}-{y_end}_x{x_start}-{x_end}{ch_suffix}.tif"
+                    tiff.imwrite(os.path.join(output_dir, tile_filename), tile['data'])
+                all_tiles.extend(tiles)
+        else:
+            tiles = tile_image_3d_3views(ch_image, tile_size=tile_size, overlap_xy=overlap)
+            for i, tile in enumerate(tiles):
+                z_start, z_end = tile['z_start'], tile['z_end']
+                y_start, y_end = tile['y_start'], tile['y_end']
+                x_start, x_end = tile['x_start'], tile['x_end']
+                tile_filename = f"{basename}_tile_{i:04d}_z{z_start}-{z_end}_y{y_start}-{y_end}_x{x_start}-{x_end}{ch_suffix}.tif"
+                tiff.imwrite(os.path.join(output_dir, tile_filename), tile['data'])
+            all_tiles.extend(tiles)
+
+    if verbose:
+        print(f"Generated {len(all_tiles)} total tiles across {num_channels} channel(s)")
+
     return all_tiles
 
 if __name__ == "__main__":
@@ -278,8 +267,8 @@ if __name__ == "__main__":
     parser.add_argument('--input_dir', type=str, default=None, help='Path to input directory containing TIFF files (required if --file_path not provided)')
     parser.add_argument('--file_path', type=str, default=None, help='Path to specific file to process (alternative to --input_dir)')
     parser.add_argument('--model', type=str, help='Path to pretrained Cellpose model')
-    parser.add_argument('--tile_size', nargs=3, type=int, default=[256, 256, 256],
-                       help='Tile size (z y x). Default: 256 256 256')
+    parser.add_argument('--tile_size', nargs=3, type=int, default=[380, 256, 256],
+                       help='Tile size (z y x). Default: 380 256 256')
     parser.add_argument('--overlap', type=int, default=32,
                        help='XY overlap in pixels. Default: 32')
     parser.add_argument('--verbose', action='store_true',

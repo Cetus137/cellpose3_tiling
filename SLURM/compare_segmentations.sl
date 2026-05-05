@@ -1,9 +1,9 @@
 #!/bin/bash
 
 #SBATCH --job-name      compare_seg
-#SBATCH --cpus-per-task 4
-#SBATCH --mem           32G
-#SBATCH --time          02:00:00
+#SBATCH --cpus-per-task 1
+#SBATCH --mem           4G
+#SBATCH --time          01:00:00
 #SBATCH --output        slogs/compare_seg.%j.out
 #SBATCH --error         slogs/compare_seg.%j.err
 #SBATCH --exclude       compg009,compg010,compg011,compg013
@@ -18,20 +18,28 @@ source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
 # =============================================================================
 
 # Directories containing segmentations to compare
-GT_DIR="/path/to/ground_truth_segmentations"
-PRED_DIR="/path/to/predicted_segmentations"
+GT_DIR="/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2validate/combined_crops/ph_seg_minus2"
+PRED_DIR="/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2validate/combined_crops/lifeact_seg"
 
 # File patterns for matching pairs
-# Files will be matched by replacing PATTERN_GT with PATTERN_PRED
-# Example: {file}_masks.tif will match with {file}_restored_masks.tif
-PATTERN_GT="_masks.tif"
-PATTERN_PRED="_restored_masks.tif"
+# For position-based matching: use glob patterns (e.g., *_masks.tif, *.tif) - wildcards OK
+# For similarity matching: use glob patterns to find files, then match by string similarity
+# For basename matching: use literal suffixes (e.g., _masks.tif) - NO wildcards
+# NOTE: With position matching, both directories should use the same glob pattern to find corresponding files
+PATTERN_GT="*.tif"
+PATTERN_PRED="*.tif"
+
+# Matching strategy: "position", "similarity", or "basename"
+# - "position": Sort and match by index (simple, but fails if files are interleaved)
+# - "similarity": Find best string match for each file (BEST for mixed file groups like ordered/disordered)
+# - "basename": Match by replacing pattern_gt with pattern_pred in filename
+MATCH_BY="similarity"
 
 # IoU threshold for object matching (0.0 to 1.0, typically 0.5)
-IOU_THRESHOLD=0.5
+IOU_THRESHOLD=0.25
 
 # Output file for detailed results (optional, leave empty to skip saving)
-RESULTS_FILE="${GT_DIR}/comparison_results.txt"
+RESULTS_FILE="/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2validate/figure_data/ph_minus2_lifeact_comparison_results_IoU_025_DICE.txt"
 
 # Script directory
 SCRIPT_DIR="/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
@@ -47,6 +55,7 @@ echo "Ground truth directory: ${GT_DIR}"
 echo "Prediction directory: ${PRED_DIR}"
 echo "GT pattern: ${PATTERN_GT}"
 echo "Pred pattern: ${PATTERN_PRED}"
+echo "Matching strategy: ${MATCH_BY}"
 echo "IoU threshold: ${IOU_THRESHOLD}"
 echo "Results file: ${RESULTS_FILE}"
 echo ""
@@ -65,7 +74,8 @@ results = batch_compare_segmentations(
     pattern_gt='${PATTERN_GT}',
     pattern_pred='${PATTERN_PRED}',
     iou_threshold=${IOU_THRESHOLD},
-    save_results='${RESULTS_FILE}' if '${RESULTS_FILE}' else None
+    save_results='${RESULTS_FILE}' if '${RESULTS_FILE}' else None,
+    match_by='${MATCH_BY}'
 )
 
 if results is not None:

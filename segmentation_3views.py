@@ -11,19 +11,40 @@ def segment_3D_stack(image_stack, config, view):
 
     shape = image_stack.shape
     print(shape)
-    flowsx_stack = np.zeros_like(image_stack)
-    flowsy_stack = np.zeros_like(image_stack)
-    flowsz_stack = np.zeros_like(image_stack)
-    cell_prob_stack = np.zeros_like(image_stack)
+
+    has_channels = image_stack.ndim == 4
+    if has_channels:
+        if shape[0] <= 4:
+            # (channels, slices, y, x)
+            stack_for_eval = image_stack
+        else:
+            raise ValueError(
+                f"Channel-aware input must be channel-first (channels, slices, y, x); got {shape}."
+            )
+        _, n_slices, dim_1, dim_2 = stack_for_eval.shape
+    elif image_stack.ndim == 3:
+        stack_for_eval = image_stack
+        n_slices, dim_1, dim_2 = shape
+    else:
+        raise ValueError(
+            f"Expected image_stack with shape (slices, y, x) or channel-first (channels, slices, y, x), got {shape}"
+        )
+
+    flowsx_stack = np.zeros((n_slices, dim_1, dim_2), dtype=np.float32)
+    flowsy_stack = np.zeros((n_slices, dim_1, dim_2), dtype=np.float32)
+    flowsz_stack = np.zeros((n_slices, dim_1, dim_2), dtype=np.float32)
+    cell_prob_stack = np.zeros((n_slices, dim_1, dim_2), dtype=np.float32)
 
     model = config['model']
 
+    channels = config.get('channels', [0, 0])
+
     if view == 'XY':
         print('Segmenting view XY')
-        for i in range(shape[0]):
+        for i in range(n_slices):
             print('Segmenting slice', i)
-            image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'] , cellprob_threshold=config.get('cell_prob_threshold', 0.0),
+            image = stack_for_eval[:, i, :, :] if has_channels else stack_for_eval[i]
+            masks, flows, styles = model.eval(image, channels=channels,batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'] , cellprob_threshold=config.get('cell_prob_threshold', 0.0),
                                               diameter=config.get('diameter', None) )
 
             flowsx_stack[i, :, :] = flows[1][1]
@@ -33,9 +54,9 @@ def segment_3D_stack(image_stack, config, view):
         tiff.imwrite('cellprob_xy_raw.tif', cell_prob_stack.astype(np.float32))
     elif view == 'XZ':
         print('Segmenting view XZ')
-        for i in range(shape[0]):
-            image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, channels=[0, 0],batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0),
+        for i in range(n_slices):
+            image = stack_for_eval[:, i, :, :] if has_channels else stack_for_eval[i]
+            masks, flows, styles = model.eval(image, channels=channels,batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0),
                                               diameter=config.get('diameter', None) )
 
             flowsx_stack[i, :, :] = flows[1][1]
@@ -54,9 +75,9 @@ def segment_3D_stack(image_stack, config, view):
 
     elif view == 'YZ':
         print('Segmenting view YZ')
-        for i in range(shape[0]):
-            image = image_stack[i, :, :]
-            masks, flows, styles = model.eval(image, channels=[0, 0], batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0),
+        for i in range(n_slices):
+            image = stack_for_eval[:, i, :, :] if has_channels else stack_for_eval[i]
+            masks, flows, styles = model.eval(image, channels=channels, batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0),
                                               diameter=config.get('diameter', None) )
 
             flowsy_stack[i, :, :] = flows[1][1]
@@ -111,6 +132,7 @@ def segment_zstack_3views(vid_frame_3views, model, cellpose_config_dict=None):
         'do_3D': False,
         'diameter': None,
         'min_size': 100,
+        'channels': [0, 0],
         'z_axis': 0,
         'gamma': 1.0,
         'cell_prob_threshold': 8.0,
@@ -119,9 +141,25 @@ def segment_zstack_3views(vid_frame_3views, model, cellpose_config_dict=None):
 
     config = {**default_config, **(cellpose_config_dict or {})}
 
-    img_xy = np.transpose(vid_frame_3views[0,...], (0, 1, 2))   #shape (z,y,x)
-    img_xz = np.transpose(vid_frame_3views[1,...], (1 ,0, 2))   #transpose to (y,z,x)
-    img_yz = np.transpose(vid_frame_3views[2,...], (2, 0, 1))   #transpose to (x,z,y) 
+    if vid_frame_3views.ndim == 4 and vid_frame_3views.shape[0] == 3:
+        img_xy = np.transpose(vid_frame_3views[0, ...], (0, 1, 2))
+        img_xz = np.transpose(vid_frame_3views[1, ...], (1, 0, 2))
+        img_yz = np.transpose(vid_frame_3views[2, ...], (2, 0, 1))
+    elif vid_frame_3views.ndim == 5 and vid_frame_3views.shape[0] == 3:
+        # input shape: (views, channels, z, y, x)
+        img_xy = vid_frame_3views[0, ...]
+        img_xz = np.transpose(vid_frame_3views[1, ...], (0, 2, 1, 3))
+        img_yz = np.transpose(vid_frame_3views[2, ...], (0, 3, 1, 2))
+    elif vid_frame_3views.ndim == 4:
+        # input shape: (channels, z, y, x) -> build XY/XZ/YZ with channels retained
+        img_xy = vid_frame_3views
+        img_xz = np.transpose(vid_frame_3views, (0, 2, 1, 3))
+        img_yz = np.transpose(vid_frame_3views, (0, 3, 1, 2))
+    else:
+        raise ValueError(
+            "Expected input shape (3, z, y, x), (3, channels, z, y, x), or (channels, z, y, x); "
+            f"got {vid_frame_3views.shape}"
+        )
 
     print('image shapes:', img_xy.shape, img_xz.shape, img_yz.shape)
     print(config)

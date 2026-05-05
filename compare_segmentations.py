@@ -4,6 +4,8 @@ from pathlib import Path
 from scipy import ndimage
 from collections import defaultdict
 import glob
+from difflib import SequenceMatcher
+import re
 
 
 def calculate_iou(mask1, mask2):
@@ -27,6 +29,63 @@ def calculate_iou(mask1, mask2):
         return 0.0
     
     return intersection / union
+
+
+def calculate_pixel_iou(seg_gt, seg_pred):
+    """
+    Calculate pixel-level IoU between two segmentations.
+    Treats all non-zero pixels as foreground, regardless of label.
+    
+    Parameters:
+    -----------
+    seg_gt : numpy.ndarray
+        Ground truth segmentation
+    seg_pred : numpy.ndarray
+        Predicted segmentation
+        
+    Returns:
+    --------
+    iou : float
+        Pixel-level IoU score between 0 and 1
+    """
+    # Convert to binary masks (foreground vs background)
+    mask_gt = seg_gt > 0
+    mask_pred = seg_pred > 0
+    
+    return calculate_iou(mask_gt, mask_pred)
+
+
+def calculate_pixel_dice(seg_gt, seg_pred):
+    """
+    Calculate pixel-level DICE score between two segmentations.
+    Treats all non-zero pixels as foreground, regardless of label.
+    
+    DICE = 2 * |A ∩ B| / (|A| + |B|)
+    
+    Parameters:
+    -----------
+    seg_gt : numpy.ndarray
+        Ground truth segmentation
+    seg_pred : numpy.ndarray
+        Predicted segmentation
+        
+    Returns:
+    --------
+    dice : float
+        Pixel-level DICE score between 0 and 1
+    """
+    # Convert to binary masks (foreground vs background)
+    mask_gt = seg_gt > 0
+    mask_pred = seg_pred > 0
+    
+    intersection = np.logical_and(mask_gt, mask_pred).sum()
+    size_gt = mask_gt.sum()
+    size_pred = mask_pred.sum()
+    
+    if size_gt + size_pred == 0:
+        return 1.0  # Both empty
+    
+    return 2 * intersection / (size_gt + size_pred)
 
 
 def match_objects(seg_gt, seg_pred, iou_threshold=0.5):
@@ -117,17 +176,17 @@ def calculate_object_f1(seg_gt, seg_pred, iou_threshold=0.5, return_detailed=Fal
         Object-level F1 score between 0 and 1
     or
     metrics : dict
-        Dictionary containing f1_score, precision, recall, tp, fp, fn
+        Dictionary containing f1_score, precision, recall, pixel_iou, pixel_dice, tp, fp, fn
     """
     # Match objects between segmentations
     matches, unmatched_gt, unmatched_pred = match_objects(seg_gt, seg_pred, iou_threshold)
     
-    # Calculate metrics
+    # Calculate object-level metrics
     tp = len(matches)  # True positives: matched ground truth objects
     fp = len(unmatched_pred)  # False positives: unmatched predicted objects
     fn = len(unmatched_gt)  # False negatives: unmatched ground truth objects
     
-    # Calculate F1 score
+    # Calculate object-level F1 score
     if tp == 0 and fp == 0 and fn == 0:
         # Both segmentations are empty
         f1_score = 1.0
@@ -143,11 +202,17 @@ def calculate_object_f1(seg_gt, seg_pred, iou_threshold=0.5, return_detailed=Fal
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1_score = 2 * tp / (2 * tp + fp + fn)
     
+    # Calculate pixel-level metrics
+    pixel_iou = calculate_pixel_iou(seg_gt, seg_pred)
+    pixel_dice = calculate_pixel_dice(seg_gt, seg_pred)
+    
     if return_detailed:
         return {
             'f1_score': f1_score,
             'precision': precision,
             'recall': recall,
+            'pixel_iou': pixel_iou,
+            'pixel_dice': pixel_dice,
             'tp': tp,
             'fp': fp,
             'fn': fn,
@@ -195,9 +260,11 @@ def compare_segmentation_pair(file_gt, file_pred, iou_threshold=0.5, return_deta
     result = calculate_object_f1(seg_gt, seg_pred, iou_threshold, return_detailed)
     
     if return_detailed:
-        print(f"F1 Score: {result['f1_score']:.4f}")
+        print(f"Object-level F1 Score: {result['f1_score']:.4f}")
         print(f"Precision: {result['precision']:.4f}")
         print(f"Recall: {result['recall']:.4f}")
+        print(f"Pixel-level IoU: {result['pixel_iou']:.4f}")
+        print(f"Pixel-level DICE: {result['pixel_dice']:.4f}")
         print(f"TP: {result['tp']}, FP: {result['fp']}, FN: {result['fn']}")
         print(f"GT objects: {result['n_gt_objects']}, Pred objects: {result['n_pred_objects']}")
     else:
@@ -206,7 +273,16 @@ def compare_segmentation_pair(file_gt, file_pred, iou_threshold=0.5, return_deta
     return result
 
 
-def find_matching_pairs(dir_gt, dir_pred, pattern_gt="_masks.tif", pattern_pred="_restored_masks.tif"):
+def string_similarity(str1, str2):
+    """
+    Calculate string similarity ratio between 0 and 1.
+    Higher score means more similar strings.
+    """
+    return SequenceMatcher(None, str1, str2).ratio()
+
+
+def find_matching_pairs(dir_gt, dir_pred, pattern_gt="_masks.tif", pattern_pred="_restored_masks.tif",
+                        match_by="position"):
     """
     Find matching pairs of segmentation files in two directories.
     
@@ -217,9 +293,21 @@ def find_matching_pairs(dir_gt, dir_pred, pattern_gt="_masks.tif", pattern_pred=
     dir_pred : str or Path
         Directory containing predicted segmentations
     pattern_gt : str
-        File pattern for ground truth files. Default is "_masks.tif"
+        File pattern for ground truth files. Can be:
+        - Glob pattern (e.g., "*_masks.tif", "*.tif") for finding files
+        - Suffix string (e.g., "_masks.tif") for basename matching
+        Default is "_masks.tif"
     pattern_pred : str
-        File pattern for predicted files. Default is "_restored_masks.tif"
+        File pattern for predicted files. Same format as pattern_gt.
+        Default is "_restored_masks.tif"
+    match_by : str
+        Matching strategy: 
+        - "position": Match by sorted position (most reproducible)
+                     Patterns can include wildcards for file finding.
+        - "similarity": Match by finding most similar filename (best for different names)
+                       Uses string similarity to find closest match for each GT file.
+        - "basename": Match by replacing pattern_gt with pattern_pred in filename
+                     Patterns should NOT include wildcards - use literal suffixes.
         
     Returns:
     --------
@@ -229,23 +317,76 @@ def find_matching_pairs(dir_gt, dir_pred, pattern_gt="_masks.tif", pattern_pred=
     dir_gt = Path(dir_gt)
     dir_pred = Path(dir_pred)
     
-    # Get all files matching the ground truth pattern
-    gt_files = sorted(dir_gt.glob(f"*{pattern_gt}"))
+    # Ensure patterns are valid glob patterns (don't double up on *)
+    gt_glob = pattern_gt if pattern_gt.startswith('*') else f"*{pattern_gt}"
+    pred_glob = pattern_pred if pattern_pred.startswith('*') else f"*{pattern_pred}"
+    
+    # Get all files matching the patterns
+    gt_files = sorted(dir_gt.glob(gt_glob))
+    pred_files = sorted(dir_pred.glob(pred_glob))
     
     pairs = []
     
-    for gt_file in gt_files:
-        # Extract base name by removing the pattern
-        base_name = gt_file.name.replace(pattern_gt, "")
+    if match_by == "position":
+        # Simple position-based matching
+        if len(gt_files) != len(pred_files):
+            print(f"WARNING: Different number of files in directories!")
+            print(f"  GT: {len(gt_files)} files, Pred: {len(pred_files)} files")
+            print(f"  Will match first {min(len(gt_files), len(pred_files))} pairs")
         
-        # Construct expected prediction file name
-        pred_file = dir_pred / f"{base_name}{pattern_pred}"
-        
-        if pred_file.exists():
+        for i, (gt_file, pred_file) in enumerate(zip(gt_files, pred_files)):
             pairs.append((gt_file, pred_file))
-            print(f"Found pair: {gt_file.name} <-> {pred_file.name}")
-        else:
-            print(f"Warning: No matching prediction for {gt_file.name}")
+            print(f"Pair {i+1}: {gt_file.name} <-> {pred_file.name}")
+    
+    elif match_by == "similarity":
+        # String similarity matching - find closest filename for each GT file
+        used_pred_files = set()
+        
+        for gt_file in gt_files:
+            best_match = None
+            best_score = 0.0
+            
+            # Find the most similar prediction file
+            for pred_file in pred_files:
+                if pred_file in used_pred_files:
+                    continue
+                    
+                similarity = string_similarity(gt_file.name, pred_file.name)
+                
+                if similarity > best_score:
+                    best_score = similarity
+                    best_match = pred_file
+            
+            if best_match is not None:
+                pairs.append((gt_file, best_match))
+                used_pred_files.add(best_match)
+                print(f"Pair {len(pairs)}: {gt_file.name} <-> {best_match.name} (similarity: {best_score:.3f})")
+            else:
+                print(f"Warning: No matching prediction for {gt_file.name}")
+        
+        # Report any unmatched files
+        if len(gt_files) != len(pairs):
+            print(f"\\nWARNING: {len(gt_files) - len(pairs)} GT files could not be matched!")
+        if len(pred_files) != len(pairs):
+            print(f"WARNING: {len(pred_files) - len(pairs)} prediction files were not used!")
+    
+    elif match_by == "basename":
+        # Original basename matching
+        for gt_file in gt_files:
+            # Extract base name by removing the pattern
+            base_name = gt_file.name.replace(pattern_gt, "")
+            
+            # Construct expected prediction file name
+            pred_file = dir_pred / f"{base_name}{pattern_pred}"
+            
+            if pred_file.exists():
+                pairs.append((gt_file, pred_file))
+                print(f"Found pair: {gt_file.name} <-> {pred_file.name}")
+            else:
+                print(f"Warning: No matching prediction for {gt_file.name}")
+    
+    else:
+        raise ValueError(f"Invalid match_by value: {match_by}. Use 'position', 'similarity', or 'basename'")
     
     print(f"\nFound {len(pairs)} matching pairs")
     return pairs
@@ -254,7 +395,8 @@ def find_matching_pairs(dir_gt, dir_pred, pattern_gt="_masks.tif", pattern_pred=
 def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif", 
                                  pattern_pred="_restored_masks.tif", 
                                  iou_threshold=0.5, 
-                                 save_results=None):
+                                 save_results=None,
+                                 match_by="position"):
     """
     Compare all matching segmentation pairs in two directories and calculate overall F1 score.
     
@@ -272,18 +414,26 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
         Minimum IoU to consider objects as matching. Default is 0.5
     save_results : str or Path or None
         If provided, save detailed results to this file
+    match_by : str
+        Matching strategy: "position" (default), "similarity" (best for mixed files), or "basename"
         
     Returns:
     --------
     results : dict
         Dictionary containing:
-            - 'overall_f1': F1 score aggregated across all pairs
-            - 'mean_f1': Mean F1 score across pairs
+            - 'overall_f1': Object-level F1 score aggregated across all pairs
+            - 'overall_precision': Object-level precision aggregated
+            - 'overall_recall': Object-level recall aggregated
+            - 'overall_pixel_iou': Pixel-level IoU aggregated across all pixels
+            - 'overall_pixel_dice': Pixel-level DICE aggregated across all pixels
+            - 'mean_f1': Mean object-level F1 score across pairs
+            - 'mean_pixel_iou': Mean pixel-level IoU across pairs
+            - 'mean_pixel_dice': Mean pixel-level DICE across pairs
             - 'per_file_results': List of per-file results
-            - 'total_tp', 'total_fp', 'total_fn': Aggregated counts
+            - 'total_tp', 'total_fp', 'total_fn': Aggregated object counts
     """
     # Find matching pairs
-    pairs = find_matching_pairs(dir_gt, dir_pred, pattern_gt, pattern_pred)
+    pairs = find_matching_pairs(dir_gt, dir_pred, pattern_gt, pattern_pred, match_by)
     
     if len(pairs) == 0:
         print("No matching pairs found!")
@@ -298,6 +448,10 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
     total_tp = 0
     total_fp = 0
     total_fn = 0
+    total_pixel_intersection = 0
+    total_pixel_union = 0
+    total_pixel_gt = 0
+    total_pixel_pred = 0
     
     for i, (gt_file, pred_file) in enumerate(pairs, 1):
         print(f"\n[{i}/{len(pairs)}] Processing: {gt_file.name}")
@@ -316,6 +470,8 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
             'f1_score': metrics['f1_score'],
             'precision': metrics['precision'],
             'recall': metrics['recall'],
+            'pixel_iou': metrics['pixel_iou'],
+            'pixel_dice': metrics['pixel_dice'],
             'tp': metrics['tp'],
             'fp': metrics['fp'],
             'fn': metrics['fn'],
@@ -329,7 +485,15 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
         total_fp += metrics['fp']
         total_fn += metrics['fn']
         
-        print(f"  F1: {metrics['f1_score']:.4f}, Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}")
+        # Accumulate pixel-level metrics
+        mask_gt = seg_gt > 0
+        mask_pred = seg_pred > 0
+        total_pixel_intersection += np.logical_and(mask_gt, mask_pred).sum()
+        total_pixel_union += np.logical_or(mask_gt, mask_pred).sum()
+        total_pixel_gt += mask_gt.sum()
+        total_pixel_pred += mask_pred.sum()
+        
+        print(f"  F1: {metrics['f1_score']:.4f}, Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}, IoU: {metrics['pixel_iou']:.4f}, DICE: {metrics['pixel_dice']:.4f}")
     
     # Calculate overall F1 (aggregated across all objects)
     if total_tp == 0 and total_fp == 0 and total_fn == 0:
@@ -345,15 +509,25 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
         overall_recall = total_tp / (total_tp + total_fn)
         overall_f1 = 2 * total_tp / (2 * total_tp + total_fp + total_fn)
     
-    # Calculate mean F1 (average across files)
+    # Calculate mean metrics (average across files)
     mean_f1 = np.mean([r['f1_score'] for r in per_file_results])
+    mean_pixel_iou = np.mean([r['pixel_iou'] for r in per_file_results])
+    mean_pixel_dice = np.mean([r['pixel_dice'] for r in per_file_results])
+    
+    # Calculate overall pixel-level metrics (aggregated across all pixels)
+    overall_pixel_iou = total_pixel_intersection / total_pixel_union if total_pixel_union > 0 else 0.0
+    overall_pixel_dice = 2 * total_pixel_intersection / (total_pixel_gt + total_pixel_pred) if (total_pixel_gt + total_pixel_pred) > 0 else 0.0
     
     # Summary results
     results = {
         'overall_f1': overall_f1,
         'overall_precision': overall_precision,
         'overall_recall': overall_recall,
+        'overall_pixel_iou': overall_pixel_iou,
+        'overall_pixel_dice': overall_pixel_dice,
         'mean_f1': mean_f1,
+        'mean_pixel_iou': mean_pixel_iou,
+        'mean_pixel_dice': mean_pixel_dice,
         'total_tp': total_tp,
         'total_fp': total_fp,
         'total_fn': total_fn,
@@ -366,11 +540,18 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
     print("SUMMARY")
     print("="*80)
     print(f"Number of pairs processed: {len(pairs)}")
-    print(f"\nOverall F1 Score (aggregated): {overall_f1:.4f}")
+    print(f"\n--- Object-Level Metrics ---")
+    print(f"Overall F1 Score (aggregated): {overall_f1:.4f}")
     print(f"Overall Precision: {overall_precision:.4f}")
     print(f"Overall Recall: {overall_recall:.4f}")
-    print(f"\nMean F1 Score (per-file average): {mean_f1:.4f}")
-    print(f"\nTotal TP: {total_tp}, FP: {total_fp}, FN: {total_fn}")
+    print(f"Mean F1 Score (per-file average): {mean_f1:.4f}")
+    print(f"\n--- Pixel-Level Metrics ---")
+    print(f"Overall Pixel IoU (aggregated): {overall_pixel_iou:.4f}")
+    print(f"Overall Pixel DICE (aggregated): {overall_pixel_dice:.4f}")
+    print(f"Mean Pixel IoU (per-file average): {mean_pixel_iou:.4f}")
+    print(f"Mean Pixel DICE (per-file average): {mean_pixel_dice:.4f}")
+    print(f"\n--- Object Counts ---")
+    print(f"Total TP: {total_tp}, FP: {total_fp}, FN: {total_fn}")
     print(f"Total GT objects: {total_tp + total_fn}")
     print(f"Total Pred objects: {total_tp + total_fp}")
     
@@ -391,10 +572,17 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
             f.write("="*80 + "\n")
             f.write("OVERALL METRICS\n")
             f.write("="*80 + "\n")
+            f.write("\n--- Object-Level Metrics ---\n")
             f.write(f"Overall F1 Score (aggregated): {overall_f1:.4f}\n")
             f.write(f"Overall Precision: {overall_precision:.4f}\n")
             f.write(f"Overall Recall: {overall_recall:.4f}\n")
             f.write(f"Mean F1 Score (per-file): {mean_f1:.4f}\n")
+            f.write("\n--- Pixel-Level Metrics ---\n")
+            f.write(f"Overall Pixel IoU (aggregated): {overall_pixel_iou:.4f}\n")
+            f.write(f"Overall Pixel DICE (aggregated): {overall_pixel_dice:.4f}\n")
+            f.write(f"Mean Pixel IoU (per-file): {mean_pixel_iou:.4f}\n")
+            f.write(f"Mean Pixel DICE (per-file): {mean_pixel_dice:.4f}\n")
+            f.write("\n--- Object Counts ---\n")
             f.write(f"Total TP: {total_tp}, FP: {total_fp}, FN: {total_fn}\n\n")
             
             f.write("="*80 + "\n")
@@ -405,6 +593,7 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
                 f.write(f"GT: {Path(result['gt_file']).name}\n")
                 f.write(f"Pred: {Path(result['pred_file']).name}\n")
                 f.write(f"  F1: {result['f1_score']:.4f}, Precision: {result['precision']:.4f}, Recall: {result['recall']:.4f}\n")
+                f.write(f"  Pixel IoU: {result['pixel_iou']:.4f}, Pixel DICE: {result['pixel_dice']:.4f}\n")
                 f.write(f"  TP: {result['tp']}, FP: {result['fp']}, FN: {result['fn']}\n")
                 f.write(f"  GT objects: {result['n_gt_objects']}, Pred objects: {result['n_pred_objects']}\n\n")
     
@@ -423,14 +612,35 @@ if __name__ == "__main__":
         return_detailed=True
     )
     
-    # Batch compare directories
+    # Batch compare with position matching (sort and match by index)
     results = batch_compare_segmentations(
         dir_gt="path/to/ground_truth_dir",
         dir_pred="path/to/prediction_dir",
         pattern_gt="_masks.tif",
         pattern_pred="_restored_masks.tif",
         iou_threshold=0.5,
-        save_results="comparison_results.txt"
+        save_results="comparison_results.txt",
+        match_by="position"  # Sorts both dirs and matches by index
+    )
+    
+    # Batch compare with similarity matching (BEST for mixed crops or different naming)
+    results = batch_compare_segmentations(
+        dir_gt="path/to/ground_truth_dir",
+        dir_pred="path/to/prediction_dir",
+        pattern_gt="*_masks.tif",
+        pattern_pred="*.tif",
+        iou_threshold=0.5,
+        match_by="similarity"  # Matches by finding most similar filename
+    )
+    
+    # Batch compare with basename matching (if files have same base name)
+    results = batch_compare_segmentations(
+        dir_gt="path/to/ground_truth_dir",
+        dir_pred="path/to/prediction_dir",
+        pattern_gt="_masks.tif",
+        pattern_pred="_restored_masks.tif",
+        iou_threshold=0.5,
+        match_by="basename"  # Matches file1_masks.tif with file1_restored_masks.tif
     )
     """
     pass
