@@ -6,6 +6,7 @@ from cellpose.dynamics import compute_masks
 import cellpose
 from importlib.metadata import version as _getv
 import pkg_resources
+import time
 
 def segment_3D_stack(image_stack, config, view):
 
@@ -39,59 +40,60 @@ def segment_3D_stack(image_stack, config, view):
 
     channels = config.get('channels', [0, 0])
 
+    use_gpu    = config.get('use_gpu', False)
+    batch_size = config['batch_size'] if use_gpu else 1
+    eval_kwargs = dict(
+        channels=channels,
+        batch_size=batch_size,
+        do_3D=False,
+        min_size=config['min_size'],
+        cellprob_threshold=config.get('cell_prob_threshold', 0.0),
+        diameter=config.get('diameter', None),
+    )
+
+    def _extract_flows(flows_list, x_idx, y_idx):
+        flowsx = np.stack([f[1][x_idx] for f in flows_list])
+        flowsy = np.stack([f[1][y_idx] for f in flows_list])
+        cellprob = np.stack([f[2]       for f in flows_list])
+        return flowsx, flowsy, cellprob
+
     if view == 'XY':
+        t0 = time.time()
         print('Segmenting view XY')
-        for i in range(n_slices):
-            print('Segmenting slice', i)
-            image = stack_for_eval[:, i, :, :] if has_channels else stack_for_eval[i]
-            masks, flows, styles = model.eval(image, channels=channels,batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'] , cellprob_threshold=config.get('cell_prob_threshold', 0.0),
-                                              diameter=config.get('diameter', None) )
+        images = [stack_for_eval[:, i, :, :] if has_channels else stack_for_eval[i]
+                  for i in range(n_slices)]
+        _, flows_list, _ = model.eval(images, **eval_kwargs)
+        flowsx_stack, flowsy_stack_tmp, cell_prob_stack = _extract_flows(flows_list, 1, 0)
+        flowsy_stack = flowsy_stack_tmp
+        print(f'XY done in {time.time()-t0:.1f}s')
 
-            flowsx_stack[i, :, :] = flows[1][1]
-            flowsy_stack[i, :, :] = flows[1][0]
-            cell_prob_stack[i, :, :] = flows[2]
-
-        tiff.imwrite('cellprob_xy_raw.tif', cell_prob_stack.astype(np.float32))
     elif view == 'XZ':
+        t0 = time.time()
         print('Segmenting view XZ')
-        for i in range(n_slices):
-            image = stack_for_eval[:, i, :, :] if has_channels else stack_for_eval[i]
-            masks, flows, styles = model.eval(image, channels=channels,batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0),
-                                              diameter=config.get('diameter', None) )
+        images = [stack_for_eval[:, i, :, :] if has_channels else stack_for_eval[i]
+                  for i in range(n_slices)]
+        _, flows_list, _ = model.eval(images, **eval_kwargs)
+        flowsx_stack, flowsz_stack, cell_prob_stack = _extract_flows(flows_list, 1, 0)
 
-            flowsx_stack[i, :, :] = flows[1][1]
-            flowsz_stack[i, :, :] = flows[1][0]
-            cell_prob_stack[i, :, :] = flows[2]
-
-        #transpose to be consistent with XY view
-        flowsz_stack = np.transpose(flowsz_stack, (1, 0, 2))
-        flowsx_stack = np.transpose(flowsx_stack, (1, 0, 2))
-        flowsy_stack = np.transpose(flowsy_stack, (1, 0, 2))
+        flowsz_stack   = np.transpose(flowsz_stack,   (1, 0, 2))
+        flowsx_stack   = np.transpose(flowsx_stack,   (1, 0, 2))
+        flowsy_stack   = np.transpose(flowsy_stack,   (1, 0, 2))
         cell_prob_stack = np.transpose(cell_prob_stack, (1, 0, 2))
-
-        print('after transpose', flowsz_stack.shape)
-
-        tiff.imwrite('cellprob_xz_raw.tif', cell_prob_stack.astype(np.float32))
+        print(f'XZ done in {time.time()-t0:.1f}s')
 
     elif view == 'YZ':
+        t0 = time.time()
         print('Segmenting view YZ')
-        for i in range(n_slices):
-            image = stack_for_eval[:, i, :, :] if has_channels else stack_for_eval[i]
-            masks, flows, styles = model.eval(image, channels=channels, batch_size=config['batch_size'], do_3D=False, min_size=config['min_size'], cellprob_threshold=config.get('cell_prob_threshold', 0.0),
-                                              diameter=config.get('diameter', None) )
+        images = [stack_for_eval[:, i, :, :] if has_channels else stack_for_eval[i]
+                  for i in range(n_slices)]
+        _, flows_list, _ = model.eval(images, **eval_kwargs)
+        flowsy_stack, flowsz_stack, cell_prob_stack = _extract_flows(flows_list, 1, 0)
 
-            flowsy_stack[i, :, :] = flows[1][1]
-            flowsz_stack[i, :, :] = flows[1][0]
-            cell_prob_stack[i, :, :] = flows[2]
-
-        #transpose to be consistent with XY view
-        flowsy_stack = np.transpose(flowsy_stack, (1, 2, 0))
-        flowsz_stack = np.transpose(flowsz_stack, (1, 2, 0))
-        flowsx_stack = np.transpose(flowsx_stack, (1, 2, 0))
+        flowsy_stack   = np.transpose(flowsy_stack,   (1, 2, 0))
+        flowsz_stack   = np.transpose(flowsz_stack,   (1, 2, 0))
+        flowsx_stack   = np.transpose(flowsx_stack,   (1, 2, 0))
         cell_prob_stack = np.transpose(cell_prob_stack, (1, 2, 0))
-
-        print('after transpose', flowsy_stack.shape)
-        tiff.imwrite('cellprob_yz_raw.tif', cell_prob_stack.astype(np.float32))
+        print(f'YZ done in {time.time()-t0:.1f}s')
 
     return flowsx_stack, flowsy_stack, flowsz_stack, cell_prob_stack
 
@@ -164,7 +166,9 @@ def segment_zstack_3views(vid_frame_3views, model, cellpose_config_dict=None):
     print('image shapes:', img_xy.shape, img_xz.shape, img_yz.shape)
     print(config)
 
+    t_total = time.time()
     dP , cell_prob = segment_3views(img_xy, img_xz, img_yz, config)
+    print(f'3-view inference done in {time.time()-t_total:.1f}s')
 
     cell_prob_blur = ndi.gaussian_filter(cell_prob, sigma=2)
     cell_prob_blur = np.clip(cell_prob_blur, -6, 12)

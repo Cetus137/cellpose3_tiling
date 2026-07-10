@@ -88,6 +88,61 @@ def calculate_pixel_dice(seg_gt, seg_pred):
     return 2 * intersection / (size_gt + size_pred)
 
 
+def filter_by_depth(seg, max_depth, depth_axis=0):
+    """
+    Remove labeled objects that sit deeper than a cutoff along the depth axis.
+
+    An object is *kept* only if the centroid of its voxels along ``depth_axis``
+    is strictly less than ``max_depth`` (i.e. it lies in the shallow region of
+    the stack). Every other object is set to background (0). This is used to
+    restrict segmentation comparison to cells located above a given imaging
+    depth, where image quality is typically higher.
+
+    Parameters
+    ----------
+    seg : numpy.ndarray
+        Labeled segmentation (0 = background).
+    max_depth : int or float or None
+        Depth cutoff in pixels. Objects whose centroid depth < max_depth are
+        kept. If None, the segmentation is returned unchanged.
+    depth_axis : int
+        Axis corresponding to imaging depth (z). Default 0 for (Z, Y, X) volumes.
+
+    Returns
+    -------
+    filtered : numpy.ndarray
+        Copy of seg with objects deeper than the cutoff removed.
+    """
+    if max_depth is None:
+        return seg
+
+    flat = seg.ravel()
+    counts = np.bincount(flat)
+
+    # Only background present -> nothing to keep
+    if counts.size <= 1:
+        return seg
+
+    # Depth coordinate of every voxel, broadcast along the depth axis
+    nz = seg.shape[depth_axis]
+    coord_shape = [1] * seg.ndim
+    coord_shape[depth_axis] = nz
+    depth_coord = np.arange(nz, dtype=np.int32).reshape(coord_shape)
+    depth_coord = np.broadcast_to(depth_coord, seg.shape)
+
+    # Per-label centroid depth = (sum of z over voxels) / (voxel count)
+    depth_sum = np.bincount(flat, weights=depth_coord.ravel(), minlength=counts.size)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        centroid_depth = depth_sum / counts
+
+    keep = centroid_depth < max_depth
+    keep[0] = False  # background is never an object
+
+    # Look-up table maps kept labels to themselves, removed labels to 0
+    lut = np.where(keep, np.arange(counts.size), 0).astype(seg.dtype, copy=False)
+    return lut[seg]
+
+
 def match_objects(seg_gt, seg_pred, iou_threshold=0.5):
     """
     Match objects between ground truth and prediction segmentations based on IoU.
@@ -109,45 +164,80 @@ def match_objects(seg_gt, seg_pred, iou_threshold=0.5):
         Set of ground truth labels without matches
     unmatched_pred : set
         Set of predicted labels without matches
+
+    Notes:
+    ------
+    Vectorized implementation: the full overlap (contingency) table between GT
+    and predicted labels is computed in a single pass, so every pairwise IoU is
+    derived at once instead of rescanning the volume per object. The greedy
+    assignment then reproduces the original semantics exactly -- GT labels are
+    processed in ascending order, each taking its highest-IoU prediction that is
+    still available and only if that IoU >= iou_threshold.
     """
-    # Get unique labels (excluding background 0)
-    gt_labels = set(np.unique(seg_gt)) - {0}
-    pred_labels = set(np.unique(seg_pred)) - {0}
-    
-    # Track best matches for each ground truth object
+    gt_flat = seg_gt.ravel()
+    pred_flat = seg_pred.ravel()
+
+    gt_labels = np.unique(gt_flat)
+    pred_labels = np.unique(pred_flat)
+    gt_labels = gt_labels[gt_labels != 0]
+    pred_labels = pred_labels[pred_labels != 0]
+
+    # Nothing to match if either side has no objects
+    if gt_labels.size == 0 or pred_labels.size == 0:
+        return {}, set(gt_labels.tolist()), set(pred_labels.tolist())
+
+    # Per-label voxel counts (indexed by label value)
+    gt_area = np.bincount(gt_flat)
+    pred_area = np.bincount(pred_flat)
+
+    # Overlap table over foreground-of-both voxels only, encoded as a single
+    # key (gt_label * stride + pred_label) so np.unique gives per-pair counts
+    # without ever allocating a dense gt-by-pred array.
+    fg = (gt_flat != 0) & (pred_flat != 0)
+    gi = gt_flat[fg].astype(np.int64)
+    pj = pred_flat[fg].astype(np.int64)
+
     matches = {}
     matched_pred = set()
-    
-    # For each ground truth object, find best matching prediction
-    for gt_label in gt_labels:
-        gt_mask = (seg_gt == gt_label)
-        best_iou = 0.0
-        best_pred_label = None
-        
-        # Find which predicted objects overlap with this ground truth object
-        overlapping_pred_labels = set(np.unique(seg_pred[gt_mask])) - {0}
-        
-        for pred_label in overlapping_pred_labels:
-            pred_mask = (seg_pred == pred_label)
-            iou = calculate_iou(gt_mask, pred_mask)
-            
-            if iou > best_iou:
-                best_iou = iou
-                best_pred_label = pred_label
-        
-        # If best match exceeds threshold, record it
-        if best_iou >= iou_threshold and best_pred_label is not None:
-            matches[gt_label] = best_pred_label
-            matched_pred.add(best_pred_label)
-    
+
+    if gi.size > 0:
+        stride = np.int64(pred_area.size)
+        keys, inter = np.unique(gi * stride + pj, return_counts=True)
+        gt_of_pair = keys // stride
+        pred_of_pair = keys % stride
+
+        # IoU for every overlapping pair at once
+        union = gt_area[gt_of_pair] + pred_area[pred_of_pair] - inter
+        iou = inter / union
+
+        # Keep only candidate pairs that meet the threshold, then assign greedily
+        keep = iou >= iou_threshold
+        cand_gt = gt_of_pair[keep]
+        cand_pred = pred_of_pair[keep]
+        cand_iou = iou[keep]
+
+        # Order by GT ascending, then IoU descending, so the first unused pred
+        # encountered for each GT is its best available match.
+        order = np.lexsort((-cand_iou, cand_gt))
+        for k in order:
+            g = int(cand_gt[k])
+            if g in matches:
+                continue
+            p = int(cand_pred[k])
+            if p in matched_pred:
+                continue
+            matches[g] = p
+            matched_pred.add(p)
+
     # Identify unmatched objects
-    unmatched_gt = gt_labels - set(matches.keys())
-    unmatched_pred = pred_labels - matched_pred
-    
+    unmatched_gt = set(gt_labels.tolist()) - set(matches.keys())
+    unmatched_pred = set(pred_labels.tolist()) - matched_pred
+
     return matches, unmatched_gt, unmatched_pred
 
 
-def calculate_object_f1(seg_gt, seg_pred, iou_threshold=0.5, return_detailed=False):
+def calculate_object_f1(seg_gt, seg_pred, iou_threshold=0.5, return_detailed=False,
+                        max_depth=None, depth_axis=0):
     """
     Calculate object-level F1 score between two volumetric segmentations.
     
@@ -169,7 +259,12 @@ def calculate_object_f1(seg_gt, seg_pred, iou_threshold=0.5, return_detailed=Fal
         Minimum IoU to consider objects as matching. Default is 0.5
     return_detailed : bool
         If True, return dictionary with detailed metrics
-        
+    max_depth : int or float or None
+        If set, only cells whose centroid along depth_axis is < max_depth are
+        included in the comparison (both GT and prediction are filtered).
+    depth_axis : int
+        Axis corresponding to imaging depth (z). Default 0 for (Z, Y, X) volumes.
+
     Returns:
     --------
     f1_score : float
@@ -178,6 +273,11 @@ def calculate_object_f1(seg_gt, seg_pred, iou_threshold=0.5, return_detailed=Fal
     metrics : dict
         Dictionary containing f1_score, precision, recall, pixel_iou, pixel_dice, tp, fp, fn
     """
+    # Restrict comparison to cells above the depth cutoff, if requested
+    if max_depth is not None:
+        seg_gt = filter_by_depth(seg_gt, max_depth, depth_axis)
+        seg_pred = filter_by_depth(seg_pred, max_depth, depth_axis)
+
     # Match objects between segmentations
     matches, unmatched_gt, unmatched_pred = match_objects(seg_gt, seg_pred, iou_threshold)
     
@@ -223,7 +323,8 @@ def calculate_object_f1(seg_gt, seg_pred, iou_threshold=0.5, return_detailed=Fal
     return f1_score
 
 
-def compare_segmentation_pair(file_gt, file_pred, iou_threshold=0.5, return_detailed=False):
+def compare_segmentation_pair(file_gt, file_pred, iou_threshold=0.5, return_detailed=False,
+                              max_depth=None, depth_axis=0):
     """
     Load two volumetric tif segmentations and calculate object-level F1 score.
     
@@ -255,9 +356,12 @@ def compare_segmentation_pair(file_gt, file_pred, iou_threshold=0.5, return_deta
         raise ValueError(f"Shape mismatch: GT {seg_gt.shape} vs Pred {seg_pred.shape}")
     
     print(f"Segmentation shape: {seg_gt.shape}")
-    
+    if max_depth is not None:
+        print(f"Depth filter: keeping cells with centroid depth < {max_depth} px (axis {depth_axis})")
+
     # Calculate F1 score
-    result = calculate_object_f1(seg_gt, seg_pred, iou_threshold, return_detailed)
+    result = calculate_object_f1(seg_gt, seg_pred, iou_threshold, return_detailed,
+                                 max_depth=max_depth, depth_axis=depth_axis)
     
     if return_detailed:
         print(f"Object-level F1 Score: {result['f1_score']:.4f}")
@@ -392,11 +496,13 @@ def find_matching_pairs(dir_gt, dir_pred, pattern_gt="_masks.tif", pattern_pred=
     return pairs
 
 
-def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif", 
-                                 pattern_pred="_restored_masks.tif", 
-                                 iou_threshold=0.5, 
+def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
+                                 pattern_pred="_restored_masks.tif",
+                                 iou_threshold=0.5,
                                  save_results=None,
-                                 match_by="position"):
+                                 match_by="position",
+                                 max_depth=None,
+                                 depth_axis=0):
     """
     Compare all matching segmentation pairs in two directories and calculate overall F1 score.
     
@@ -416,7 +522,13 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
         If provided, save detailed results to this file
     match_by : str
         Matching strategy: "position" (default), "similarity" (best for mixed files), or "basename"
-        
+    max_depth : int or float or None
+        If set, only cells whose centroid along depth_axis is < max_depth are
+        included in the comparison (applied to both GT and prediction before
+        matching, so all object- and pixel-level metrics reflect the filter).
+    depth_axis : int
+        Axis corresponding to imaging depth (z). Default 0 for (Z, Y, X) volumes.
+
     Returns:
     --------
     results : dict
@@ -459,8 +571,14 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
         # Load and compare
         seg_gt = tiff.imread(gt_file)
         seg_pred = tiff.imread(pred_file)
-        
-        # Calculate metrics
+
+        # Apply depth filter once here so that object- and pixel-level metrics
+        # (accumulated below) are all computed on the same filtered volumes
+        if max_depth is not None:
+            seg_gt = filter_by_depth(seg_gt, max_depth, depth_axis)
+            seg_pred = filter_by_depth(seg_pred, max_depth, depth_axis)
+
+        # Calculate metrics (arrays already filtered, so pass max_depth=None)
         metrics = calculate_object_f1(seg_gt, seg_pred, iou_threshold, return_detailed=True)
         
         # Store results
@@ -567,6 +685,9 @@ def batch_compare_segmentations(dir_gt, dir_pred, pattern_gt="_masks.tif",
             f.write(f"Ground truth directory: {dir_gt}\n")
             f.write(f"Prediction directory: {dir_pred}\n")
             f.write(f"IoU threshold: {iou_threshold}\n")
+            if max_depth is not None:
+                f.write(f"Depth filter: cells with centroid depth < {max_depth} px "
+                        f"(axis {depth_axis}) only\n")
             f.write(f"Number of pairs: {len(pairs)}\n\n")
             
             f.write("="*80 + "\n")

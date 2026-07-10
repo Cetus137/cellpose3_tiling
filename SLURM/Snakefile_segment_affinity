@@ -1,0 +1,84 @@
+# Snakemake workflow: affinity UNet segmentation, one tile per job.
+# Processes all .tif files in INPUT_DIR (excluding *_masks.tif) and writes
+# <name>_masks.tif to OUTPUT_DIR.
+
+import os
+from pathlib import Path
+import glob
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+INPUT_DIR   = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/lifeact"
+OUTPUT_DIR  = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/lifeact_affinity_seg"
+CHECKPOINT  = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/models/affinity_unet_ph3_centroid/affinity_unet_ep0200.pt"
+SCRIPT_DIR  = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/scripts"
+
+# Watershed parameters — min_dist: minimum voxels between seeds (set to ~min cell separation)
+#   with USE_CENTROID_SEEDS=False: tune as ~half median cell radius
+#   with USE_CENTROID_SEEDS=True:  tune as ~minimum centre-to-centre cell distance
+METHOD          = "watershed"    # "watershed" or "mutex"
+FG_THRESH       = 0.5
+FG_WEIGHT       = 0.5       # watershed only
+MIN_DIST        = 15        # watershed only
+MWS_STRIDES      = "1 1 1"  # mutex only — larger = faster, coarser
+MUTEX_CAPACITY   = 32       # mutex only — max constraints per component
+N_ATTRACTIVE_CH  = 6        # mutex only — ch 0..N-1 attract only; rest repel only
+REPEL_THRESH     = 0.3      # mutex only — 0=no repulsion, 0.5=max; tune this first
+MIN_SIZE        = 2000
+USE_CENTROID_SEEDS = True   # [watershed only] use model centroid map for seed placement
+
+# ── Input discovery ───────────────────────────────────────────────────────────
+
+input_files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.tif")))
+input_files = [f for f in input_files
+               if not f.endswith("_masks.tif")
+               and not f.endswith("_segmented.tif")]
+SAMPLES = [Path(f).stem for f in input_files]
+
+# ── Rules ─────────────────────────────────────────────────────────────────────
+
+rule all:
+    input:
+        expand(os.path.join(OUTPUT_DIR, "{sample}_masks.tif"), sample=SAMPLES)
+
+rule segment_affinity:
+    input:
+        os.path.join(INPUT_DIR, "{sample}.tif")
+    output:
+        os.path.join(OUTPUT_DIR, "{sample}_masks.tif")
+    params:
+        centroid_flag = "--use_centroid_seeds" if USE_CENTROID_SEEDS else ""
+    resources:
+        mem_mb       = 22000,
+        runtime      = 40,
+        cpus         = 1,
+        slurm_partition = "short",
+        slurm_extra  = "--exclude=compg009,compg010,compg011,compg013"
+    log:
+        "slogs/affinity_seg/segment_{sample}.log"
+    shell:
+        """
+        mkdir -p slogs/affinity_seg
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/affinity_segment.py \
+            --checkpoint  {CHECKPOINT} \
+            --input       {input} \
+            --output      {output} \
+            --method      {METHOD} \
+            --fg_thresh   {FG_THRESH} \
+            --fg_weight   {FG_WEIGHT} \
+            --min_dist    {MIN_DIST} \
+            --mws_strides    {MWS_STRIDES} \
+            --mutex_capacity {MUTEX_CAPACITY} \
+            --n_attractive_ch {N_ATTRACTIVE_CH} \
+            --repel_thresh   {REPEL_THRESH} \
+            --min_size       {MIN_SIZE} \
+            --batch_size  1 \
+            --save_maps \
+            {params.centroid_flag} \
+            &> {log}
+        """

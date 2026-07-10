@@ -1,14 +1,13 @@
 #!/bin/bash
-# Wrapper script for Snakemake segmentation workflow
+# Wrapper script for omnipose from-tiles segmentation workflow
 
-# Load Snakemake module
 module load snakemake/8.4.2-foss-2023a
 
 snakemake \
-    --snakefile Snakefile_segment \
+    --snakefile Snakefile_segment_from_tiles_omnipose \
     --executor slurm \
-    --jobs 1200 \
+    --jobs 3000 \
     --default-resources slurm_partition=short slurm_account=kir.prj \
-    --latency-wait 60 \
     --restart-times 1 \
+    --latency-wait 60 \
     "$@"

@@ -1,0 +1,194 @@
+# Snakemake workflow: affinity UNet boundary probability from pre-split tiles.
+# Mirrors Snakefile_segment_from_tiles but runs affinity inference and saves
+# only the boundary probability map (no segmentation masks).
+#
+# Two-rule pipeline:
+#   1. affinity_boundary_tile  — run affinity UNet on each tile, keep *_boundary.tif only
+#   2. reconstruct_boundary    — blend tile boundary maps into full-volume *_boundary.tif
+#                                per timepoint
+
+import os
+from pathlib import Path
+import glob
+import re
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+INPUT_DIR                = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-2a_2c_pos6-01_deskew_cgt/crop4/tiles_restored"
+RAW_TILE_DIR             = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles"
+OUTPUT_DIR               = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles_restored_affinity_boundary_perscale_weighted"
+OUTPUT_DIR_RECONSTRUCTED = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles_restored_affinity_boundary_perscale_weighted/reconstructed"
+CHECKPOINT  = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/models/affinity_unet_ph3_centroid/affinity_unet_ep0200.pt"
+SCRIPT_DIR  = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+
+# Inference tile size / overlap (internal to affinity_segment.py)
+TILE_SIZE = 128
+OVERLAP   = 32
+
+# Affinity -> boundary collapse.
+#   "legacy"            : 0.7*mean(short) + 0.3*mean(medium); long unused.
+#   "perscale_weighted" : weighted sum of per-scale min-boundaries
+#                         (short, medium, long) using BOUNDARY_WEIGHTS.
+BOUNDARY_METHOD  = "legacy"
+BOUNDARY_WEIGHTS = "0.70 0.30 0.00"   # W_SHORT W_MED W_LONG (normalised to sum 1)
+
+# Reconstruction overlap (must match tiling overlap used to create the input tiles)
+RECON_OVERLAP = 32
+
+# ── Input discovery ───────────────────────────────────────────────────────────
+files_to_seg = []
+for root, dirs, files in os.walk(INPUT_DIR):
+    for file in files:
+        if (file.endswith('.tif') or file.endswith('.tiff')) and 'tile' in file:
+            files_to_seg.append(os.path.join(root, file))
+
+N_FILES = len(files_to_seg)
+file_basenames = [os.path.splitext(os.path.basename(f))[0] for f in files_to_seg]
+file_path_map  = {os.path.splitext(os.path.basename(f))[0]: f for f in files_to_seg}
+
+print(f"Found {N_FILES} tile files to process")
+
+
+def basename_timepoint(basename):
+    m = re.search(r'(?<!\w)timepoint_(\d{4})(?!\d)', basename, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(?<!\w)tp_?(\d{4})(?!\d)', basename, flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+basename_to_timepoint = {b: basename_timepoint(b) for b in file_basenames}
+timepoints = sorted({tp for tp in basename_to_timepoint.values() if tp is not None})
+
+HAS_EXPLICIT_TIMEPOINTS = len(timepoints) > 0
+if not HAS_EXPLICIT_TIMEPOINTS:
+    timepoints = [0]
+    print("No timepoints found in tile names; assuming all tiles belong to timepoint 0000")
+else:
+    print("Found timepoints:", timepoints)
+
+# ── Rules ─────────────────────────────────────────────────────────────────────
+
+rule all:
+    input:
+        expand(
+            os.path.join(OUTPUT_DIR_RECONSTRUCTED,
+                         "restored_timepoint_{timepoint:04d}_{map}.tif"),
+            timepoint=timepoints,
+            map=["boundary", "fg", "interior", "centroid"],
+        )
+
+
+rule affinity_boundary_tile:
+    """Run affinity UNet on one tile; keep boundary probability, discard masks."""
+    input:
+        denoised = lambda wildcards: file_path_map[wildcards.basename],
+        raw      = lambda wildcards: os.path.join(RAW_TILE_DIR,
+                       os.path.basename(file_path_map[wildcards.basename])
+                       .replace("_restored.tif", ".tif")),
+    output:
+        # temp(): per-tile maps are deleted once reconstruct_boundary has
+        # blended them into the full-volume outputs, to save disk.
+        boundary = temp(os.path.join(OUTPUT_DIR, "{basename}_boundary.tif")),
+        fg       = temp(os.path.join(OUTPUT_DIR, "{basename}_fg.tif")),
+        centroid = temp(os.path.join(OUTPUT_DIR, "{basename}_centroid.tif")),
+    params:
+        masks_path = lambda wildcards: os.path.join(OUTPUT_DIR,
+                                                     f"{wildcards.basename}_masks.tif")
+    resources:
+        mem_mb          = 10000,
+        runtime         = 20,
+        cpus            = 1,
+        slurm_partition = "short",
+        slurm_extra     = "--exclude=compg009,compg010,compg011,compg013"
+    log:
+        "slogs/affinity_boundary/tile_{basename}.log"
+    shell:
+        """
+        mkdir -p slogs/affinity_boundary
+        export TMPDIR=/well/kir-fritzsche/users/aif490/tmp
+        mkdir -p $TMPDIR
+
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/scripts/affinity_segment.py \
+            --checkpoint       {CHECKPOINT} \
+            --input            {input.denoised} \
+            --mask_input       {input.raw} \
+            --output           {params.masks_path} \
+            --method           watershed \
+            --tile_size        {TILE_SIZE} \
+            --overlap          {OVERLAP} \
+            --boundary_method  {BOUNDARY_METHOD} \
+            --boundary_weights {BOUNDARY_WEIGHTS} \
+            --save_maps \
+            --batch_size  1 \
+            &> {log}
+
+        rm -f {params.masks_path}
+        """
+
+
+rule reconstruct_boundary:
+    """Blend per-tile boundary and foreground maps into full-volume outputs per timepoint."""
+    input:
+        boundary = lambda wildcards: [
+            os.path.join(OUTPUT_DIR, f"{b}_boundary.tif")
+            for b in file_basenames
+            if (basename_to_timepoint[b] == int(wildcards.timepoint))
+            or (not HAS_EXPLICIT_TIMEPOINTS)
+        ],
+        fg = lambda wildcards: [
+            os.path.join(OUTPUT_DIR, f"{b}_fg.tif")
+            for b in file_basenames
+            if (basename_to_timepoint[b] == int(wildcards.timepoint))
+            or (not HAS_EXPLICIT_TIMEPOINTS)
+        ],
+        centroid = lambda wildcards: [
+            os.path.join(OUTPUT_DIR, f"{b}_centroid.tif")
+            for b in file_basenames
+            if (basename_to_timepoint[b] == int(wildcards.timepoint))
+            or (not HAS_EXPLICIT_TIMEPOINTS)
+        ],
+    output:
+        boundary = os.path.join(OUTPUT_DIR_RECONSTRUCTED,
+                                "restored_timepoint_{timepoint,\\d{4}}_boundary.tif"),
+        fg       = os.path.join(OUTPUT_DIR_RECONSTRUCTED,
+                                "restored_timepoint_{timepoint,\\d{4}}_fg.tif"),
+        interior = os.path.join(OUTPUT_DIR_RECONSTRUCTED,
+                                "restored_timepoint_{timepoint,\\d{4}}_interior.tif"),
+        centroid = os.path.join(OUTPUT_DIR_RECONSTRUCTED,
+                                "restored_timepoint_{timepoint,\\d{4}}_centroid.tif"),
+    params:
+        timepoint  = lambda wildcards: int(wildcards.timepoint),
+        no_tp_flag = "" if HAS_EXPLICIT_TIMEPOINTS else "--no_timepoints",
+    resources:
+        mem_mb          = 50000,
+        runtime         = 30,
+        cpus            = 1,
+        slurm_partition = "short",
+        slurm_extra     = "--exclude=compg009,compg010,compg011,compg013"
+    log:
+        "slogs/affinity_boundary/reconstruct_timepoint_{timepoint}.log"
+    shell:
+        """
+        export TMPDIR=/well/kir-fritzsche/users/aif490/tmp
+        mkdir -p $TMPDIR
+
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/batch_tile_reconstruction.py \
+            --tile_dir   {OUTPUT_DIR} \
+            --output_dir {OUTPUT_DIR_RECONSTRUCTED} \
+            --timepoint  {params.timepoint} \
+            --overlap    {RECON_OVERLAP} \
+            --boundary \
+            {params.no_tp_flag} \
+            --verbose &> {log}
+        """

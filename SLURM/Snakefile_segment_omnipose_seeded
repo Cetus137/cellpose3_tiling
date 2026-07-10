@@ -1,0 +1,133 @@
+# Snakefile_segment_omnipose_seeded
+# ==================================
+# Two-stage pipeline:
+#   1. make_composite  — combine raw .tif + nuclear-seed _masks.tif
+#                        into a 2-channel composite (ch0=raw, ch1=seeds)
+#   2. segment         — run seeded omnipose 3D on the composite and
+#                        save whole-cell instance masks as *_masks.tif
+#
+# Required directory layout:
+#   RAW_DIR/
+#       sample.tif           ← raw intensity volume
+#       sample_masks.tif     ← nuclear-seed masks (paired with sample.tif)
+#
+# Outputs:
+#   COMPOSITE_DIR/sample_composite.tif
+#   OUTPUT_DIR/sample_composite_masks.tif
+
+import os
+from pathlib import Path
+import glob
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+RAW_DIR       = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/lifeact"
+SEEDS_DIR     = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/lifeact_seg_omni"
+COMPOSITE_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/lifeact_seg_omni_seeded/composites"
+OUTPUT_DIR    = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/lifeact_seg_omni_seeded/masks"
+MODEL_PATH    = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/training_seeded/composites/models/omnipose_3d_seeded_ph3_ep0010"
+SCRIPT_DIR    = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+
+# ── Inference parameters ───────────────────────────────────────────────────
+TILE_SIZE       = [128, 128, 128]
+OVERLAP         = 16
+MASK_THRESHOLD  = 0.0
+FLOW_THRESHOLD  = 0.4
+MIN_SIZE        = 5000
+
+# ── File discovery ─────────────────────────────────────────────────────────
+_EXCLUDE_SUFFIXES = ("_masks.tif", "_composite.tif")
+
+_all_tifs = sorted(glob.glob(os.path.join(RAW_DIR, "*.tif")))
+_raw_tifs = [f for f in _all_tifs if not any(f.endswith(s) for s in _EXCLUDE_SUFFIXES)]
+
+SAMPLES = []
+for _f in _raw_tifs:
+    _stem = Path(_f).stem
+    _seed_path = os.path.join(SEEDS_DIR, _stem + "_masks.tif")
+    if os.path.exists(_seed_path):
+        SAMPLES.append(_stem)
+    else:
+        print(f"WARNING: no paired _masks.tif found for {_f} — skipping")
+
+if not SAMPLES:
+    _existing = sorted(glob.glob(os.path.join(COMPOSITE_DIR, "*_composite.tif")))
+    SAMPLES = [Path(f).stem.replace("_composite", "") for f in _existing]
+    if not SAMPLES:
+        raise ValueError(
+            f"No paired (raw + _masks.tif) files found in {RAW_DIR} and "
+            f"no existing composites in {COMPOSITE_DIR}."
+        )
+    print(f"No raw+mask pairs found; using {len(SAMPLES)} existing composite(s)")
+else:
+    print(f"Found {len(SAMPLES)} sample(s)  |  model: {Path(MODEL_PATH).name}")
+
+
+# ── Rules ──────────────────────────────────────────────────────────────────
+
+rule all:
+    input:
+        expand(os.path.join(OUTPUT_DIR, "{sample}_composite_masks.tif"), sample=SAMPLES)
+
+
+rule make_composite:
+    """CPU: combine raw + nuclear-seed masks into a 2-channel composite."""
+    input:
+        raw   = os.path.join(RAW_DIR,   "{sample}.tif"),
+        masks = os.path.join(SEEDS_DIR, "{sample}_masks.tif"),
+    output:
+        os.path.join(COMPOSITE_DIR, "{sample}_composite.tif"),
+    resources:
+        runtime         = 10,
+        cpus            = 1,
+        slurm_partition = "short",
+        slurm_extra     = "--mem=8G",
+    log:
+        "slogs/omni_seeded/make_composite_{sample}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/make_composite.py \
+            --raw    {input.raw} \
+            --masks  {input.masks} \
+            --output {output} \
+            --verbose &> {log}
+        """
+
+
+rule segment:
+    """GPU: run seeded omnipose 3D on a 2-channel composite."""
+    input:
+        os.path.join(COMPOSITE_DIR, "{sample}_composite.tif"),
+    output:
+        os.path.join(OUTPUT_DIR, "{sample}_composite_masks.tif"),
+    resources:
+        mem_mb          = 32000,
+        runtime         = 60,
+        cpus            = 1,
+        slurm_partition = "short",
+        slurm_extra     = "--exclude=compg009,compg010,compg011,compg013",
+    log:
+        "slogs/omni_seeded/segment_{sample}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/omnipose_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/tiled_segmentation_omnipose_3d_seeded.py \
+            --input_file     {input} \
+            --output_dir     {OUTPUT_DIR} \
+            --model          {MODEL_PATH} \
+            --tile_size      {TILE_SIZE[0]} {TILE_SIZE[1]} {TILE_SIZE[2]} \
+            --overlap        {OVERLAP} \
+            --mask_threshold {MASK_THRESHOLD} \
+            --flow_threshold {FLOW_THRESHOLD} \
+            --min_size       {MIN_SIZE} \
+            --verbose \
+            &> {log}
+        """

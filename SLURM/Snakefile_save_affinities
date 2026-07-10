@@ -1,0 +1,123 @@
+# Save the RAW 9-channel affinities (+ fg) per tile, then reconstruct each channel
+# into a full-volume frame — for a SINGLE timepoint by default (config: TIMEPOINTS).
+#
+# Purpose: dump the affinities once so the affinity->boundary collapse recipe
+# (mean vs softmin/min, short/medium/long weighting) can be swept OFFLINE without
+# re-running the UNet. Mirrors Snakefile_segment_from_tiles_affinity_boundary but
+# uses affinity_segment.py --save_affinities and reconstruct_affinities.py.
+#
+#   snakemake -s Snakefile_save_affinities --config TIMEPOINTS="0" ...
+
+import os, re
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+INPUT_DIR    = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles_restored"
+RAW_TILE_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles"
+OUTPUT_DIR   = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles_restored_affinity_raw"
+OUTPUT_DIR_RECONSTRUCTED = os.path.join(OUTPUT_DIR, "reconstructed")
+CHECKPOINT   = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/models/affinity_unet_ph3_centroid/affinity_unet_ep0200.pt"
+SCRIPT_DIR   = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+
+TILE_SIZE = 128
+OVERLAP   = 32
+RECON_OVERLAP = 32
+N_CH = 9   # affinity channels
+
+# Which timepoints to dump (default: just 0). Override: --config TIMEPOINTS="0 1 61 62"
+WANT_TPS = [int(x) for x in str(config.get("TIMEPOINTS", "0")).split()]
+
+# ── Input discovery ───────────────────────────────────────────────────────────
+def basename_timepoint(b):
+    m = re.search(r'(?<!\w)timepoint_(\d{4})(?!\d)', b, flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+files_to_seg, file_path_map, basename_to_tp = [], {}, {}
+for root, _, files in os.walk(INPUT_DIR):
+    for f in files:
+        if (f.endswith('.tif') or f.endswith('.tiff')) and 'tile' in f:
+            b = os.path.splitext(f)[0]
+            tp = basename_timepoint(b)
+            if tp in WANT_TPS:
+                files_to_seg.append(os.path.join(root, f))
+                file_path_map[b] = os.path.join(root, f)
+                basename_to_tp[b] = tp
+
+file_basenames = list(file_path_map)
+print(f"save_affinities: {len(file_basenames)} tiles across timepoints {sorted(WANT_TPS)}")
+
+# ── Rules ─────────────────────────────────────────────────────────────────────
+rule all:
+    input:
+        expand(os.path.join(OUTPUT_DIR_RECONSTRUCTED,
+                            "restored_timepoint_{tp:04d}_{m}.tif"),
+               tp=WANT_TPS, m=[f"aff{c}" for c in range(N_CH)] + ["fg"])
+
+rule save_affinities_tile:
+    """Run the affinity UNet on one tile; save the raw 9-ch affinities + fg, no masks."""
+    input:
+        denoised = lambda wc: file_path_map[wc.basename],
+        raw      = lambda wc: os.path.join(RAW_TILE_DIR,
+                       os.path.basename(file_path_map[wc.basename]).replace("_restored.tif", ".tif")),
+    output:
+        fg  = os.path.join(OUTPUT_DIR, "{basename}_fg.tif"),
+        aff = expand(os.path.join(OUTPUT_DIR, "{{basename}}_aff{c}.tif"), c=range(N_CH)),
+    params:
+        stem = lambda wc: os.path.join(OUTPUT_DIR, f"{wc.basename}_masks.tif"),
+    resources:
+        mem_mb = 12000, runtime = 20, cpus = 1, slurm_partition = "short",
+        slurm_extra = "--exclude=compg009,compg010,compg011,compg013",
+    log:
+        "slogs/save_affinities/tile_{basename}.log"
+    shell:
+        """
+        mkdir -p slogs/save_affinities
+        export TMPDIR=/well/kir-fritzsche/users/aif490/tmp; mkdir -p $TMPDIR
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/scripts/affinity_segment.py \
+            --checkpoint {CHECKPOINT} \
+            --input      {input.denoised} \
+            --mask_input {input.raw} \
+            --output     {params.stem} \
+            --method     mutex \
+            --save_affinities \
+            --tile_size  {TILE_SIZE} \
+            --overlap    {OVERLAP} \
+            --batch_size 1 \
+            &> {log}
+        """
+
+rule reconstruct_affinities:
+    """Blend per-tile affinity/fg maps into full-volume per-channel frames."""
+    input:
+        lambda wc: expand(
+            os.path.join(OUTPUT_DIR, "{basename}_{m}.tif"),
+            basename=[b for b in file_basenames if basename_to_tp[b] == int(wc.tp)],
+            m=[f"aff{c}" for c in range(N_CH)] + ["fg"]),
+    output:
+        expand(os.path.join(OUTPUT_DIR_RECONSTRUCTED,
+                            "restored_timepoint_{{tp}}_{m}.tif"),
+               m=[f"aff{c}" for c in range(N_CH)] + ["fg"]),
+    resources:
+        mem_mb = 50000, runtime = 30, cpus = 1, slurm_partition = "short",
+        slurm_extra = "--exclude=compg009,compg010,compg011,compg013",
+    log:
+        "slogs/save_affinities/reconstruct_{tp}.log"
+    shell:
+        """
+        export TMPDIR=/well/kir-fritzsche/users/aif490/tmp; mkdir -p $TMPDIR
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/reconstruct_affinities.py \
+            --tile_dir   {OUTPUT_DIR} \
+            --output_dir {OUTPUT_DIR_RECONSTRUCTED} \
+            --timepoint  {wildcards.tp} \
+            --overlap    {RECON_OVERLAP} \
+            &> {log}
+        """

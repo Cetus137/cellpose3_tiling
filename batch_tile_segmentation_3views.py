@@ -117,6 +117,7 @@ if __name__ == "__main__":
                         '''
                     )
     
+    parser.add_argument('--input_file', type=str, default=None, help='Path to a single .tif file to process')
     parser.add_argument('--input_dir', type=str, help='Path to input directory containing .tif files')
     parser.add_argument('--output_dir', type=str, help='Output directory for results')
     parser.add_argument('--file_index', type=int, default=None, help='Index of specific file to process from input directory')
@@ -131,26 +132,47 @@ if __name__ == "__main__":
                        help='Cell diameter for Cellpose model (default: None)')
     parser.add_argument('--cellprob_threshold', type=float, default=0.0,
                        help='Cell probability threshold for Cellpose (default: 0.0)')
-    
-    args = parser.parse_args()
-    
-    # Check if running with command-line arguments or using example code
-    if args.input_dir and args.output_dir and args.model:
-        # Command-line mode
-        print("Running in command-line mode...")
-        
-        
-        # Load model
-        print(f"Loading model from {args.model}")
-        model = CellposeModel(gpu=args.gpu, pretrained_model=args.model)
-        
-        cellpose_config = {
-            'diameter': args.diameter,
-            'cell_prob_threshold': args.cellprob_threshold,
-            'use_gpu': args.gpu
-        }
+    parser.add_argument('--channels', nargs=2, type=int, default=[0, 0], metavar=('CH1', 'CH2'),
+                       help='Cellpose channels, e.g. --channels 1 2 for 2-channel input (default: 0 0)')
+    parser.add_argument('--min_size', type=int, default=100,
+                       help='Minimum object size for segmentation (default: 100)')
 
-        # Run segmentation
+    args = parser.parse_args()
+
+    if not args.output_dir or not args.model:
+        parser.error("--output_dir and --model are required")
+
+    from pathlib import Path
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading model from {args.model}")
+    model = CellposeModel(gpu=args.gpu, pretrained_model=args.model)
+
+    cellpose_config = {
+        'diameter': args.diameter,
+        'cell_prob_threshold': args.cellprob_threshold,
+        'use_gpu': args.gpu,
+        'channels': args.channels,
+        'min_size': args.min_size,
+    }
+
+    if args.input_file:
+        # Single-file mode — no directory scan needed
+        input_path = Path(args.input_file)
+        image = tiff.imread(str(input_path)).astype(np.float32)
+        image = np.squeeze(image)
+        if image.ndim == 3:
+            image = image[np.newaxis]  # (z,y,x) → (1,z,y,x) for segment_zstack_3views
+        if not args.no_normalize:
+            image = (image - image.min()) / (image.max() - image.min() + 1e-8)
+        dP_blur, cell_prob_blur = segment_zstack_3views(image, model, cellpose_config)
+        stem = input_path.stem
+        tiff.imwrite(str(output_dir / f"{stem}_dP_blur.tif"),       dP_blur.astype(np.float32))
+        tiff.imwrite(str(output_dir / f"{stem}_cellprob_blur.tif"), cell_prob_blur.astype(np.float32))
+        print(f"\nSaved flows for {stem}")
+
+    elif args.input_dir:
         batch_tile_segment_3views(
             input_dir=args.input_dir,
             output_dir=args.output_dir,
@@ -158,10 +180,12 @@ if __name__ == "__main__":
             model=model,
             cellpose_config_dict=cellpose_config,
             normalize=not args.no_normalize,
-            verbose=args.verbose
+            verbose=args.verbose,
         )
-        
-        print(f"\nSegmentation complete!")
+    else:
+        parser.error("Either --input_file or --input_dir must be provided")
+
+    print("\nSegmentation complete!")
 
 
     

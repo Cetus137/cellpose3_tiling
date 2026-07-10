@@ -75,7 +75,8 @@ def _filter_sparse(train_files, train_labels_files, min_label_pixels):
     return valid_imgs, valid_labels
 
 
-def train_model(train_dir, max_tiles=10000, seed=42, min_label_pixels=50):
+def train_model(train_dir, max_tiles=10000, seed=42, min_label_pixels=50,
+                batch_size=32, n_epochs=100):
     all_tifs   = sorted(glob.glob(os.path.join(train_dir, '*.tif')))
     raw_files  = [f for f in all_tifs if '_masks' not in f and '_flows' not in f]
 
@@ -117,13 +118,13 @@ def train_model(train_dir, max_tiles=10000, seed=42, min_label_pixels=50):
         train_labels_files=train_labels_files,
         test_files=test_files,
         test_labels_files=test_labels_files,
-        load_files=False,
-        batch_size=16,
+        load_files=True,
+        batch_size=batch_size,
         channels=[0, 0],
         save_every=10,
         weight_decay=0.1,
         learning_rate=1e-5,
-        n_epochs=100,
+        n_epochs=n_epochs,
         model_name="cp3_ph3",
     )
     print(f"Train losses: {train_losses}")
@@ -142,7 +143,10 @@ if __name__ == "__main__":
     parser.add_argument('--min_label_pixels', type=int, default=50,
                         help='Minimum pixels per label instance; slices where all '
                              'labels are smaller are dropped (default: 50)')
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--n_epochs',   type=int, default=100)
     args = parser.parse_args()
 
     train_model(args.train_dir, max_tiles=args.max_tiles, seed=args.seed,
-                min_label_pixels=args.min_label_pixels)
+                min_label_pixels=args.min_label_pixels,
+                batch_size=args.batch_size, n_epochs=args.n_epochs)

@@ -1,0 +1,188 @@
+# Snakefile_segment_from_tiles_omnipose_seeded
+# =============================================
+# Two-stage seeded-omnipose from-tiles pipeline for large volumes:
+#   1. segment_tile        — run seeded omnipose 3D on each raw tile using its
+#                            paired seed-mask; composite is built in memory
+#                            (never written to disk); flows saved as float16:
+#                              {stem}_dP_seeded.tif
+#                              {stem}_cellprob_seeded.tif
+#   2. reconstruct_from_tiles — stitch per-tile flows, run omnipose
+#                               compute_masks on full volume
+#
+# Per-tile flow files are marked temp() and deleted automatically once the
+# downstream reconstruction step completes.
+#
+# Required directory layout:
+#   RAW_DIR/
+#       *tile*.tif            ← raw intensity tiles
+#   SEEDS_DIR/
+#       *tile*_masks.tif      ← nuclear-seed masks (paired by stem)
+
+import os
+from pathlib import Path
+import glob
+import re
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+RAW_DIR                  = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles_restored"
+SEEDS_DIR                = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles_restored_omni_segmented"
+OUTPUT_DIR               = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles_restored_omni_segmented/boundary_flows"
+OUTPUT_DIR_RECONSTRUCTED = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles_restored_omni_segmented/boundary_reconstructed"
+MODEL_PATH               = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/training_seeded/composites/models/omnipose_3d_seeded_ph3_ep0080"
+SCRIPT_DIR               = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+
+# ── Inference parameters ───────────────────────────────────────────────────
+TILE_SIZE      = [128, 128, 128]
+OVERLAP        = 16
+MASK_THRESHOLD = 0.0
+FLOW_THRESHOLD = 0.4
+MIN_SIZE       = 5000
+
+# ── File discovery ─────────────────────────────────────────────────────────
+_EXCLUDE_SUFFIXES = ("_masks.tif", "_composite.tif")
+
+files_to_seg = []
+for root, dirs, files in os.walk(RAW_DIR):
+    for file in files:
+        if (file.endswith('.tif') or file.endswith('.tiff')) and 'tile' in file:
+            if not any(file.endswith(s) for s in _EXCLUDE_SUFFIXES):
+                files_to_seg.append(os.path.join(root, file))
+
+file_basenames = [os.path.splitext(os.path.basename(f))[0] for f in files_to_seg]
+file_path_map  = {os.path.splitext(os.path.basename(f))[0]: f for f in files_to_seg}
+
+# Pair raw tiles with seed masks; warn and skip unpaired tiles
+SAMPLES = []
+for stem in file_basenames:
+    seed_path = os.path.join(SEEDS_DIR, stem + "_masks.tif")
+    if os.path.exists(seed_path):
+        SAMPLES.append(stem)
+    else:
+        print(f"WARNING: no paired _masks.tif found for {stem} — skipping")
+
+if not SAMPLES:
+    raise ValueError(
+        f"No paired (raw tile + _masks.tif) files found in\n"
+        f"  RAW_DIR  : {RAW_DIR}\n"
+        f"  SEEDS_DIR: {SEEDS_DIR}"
+    )
+
+print(f"Found {len(SAMPLES)} paired tile(s)  |  model: {Path(MODEL_PATH).name}")
+
+
+def basename_timepoint(basename):
+    m = re.search(r'(?<!\w)timepoint_(\d{4})(?!\d)', basename, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(?<!\w)tp_?(\d{4})(?!\d)', basename, flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+basename_to_timepoint = {b: basename_timepoint(b) for b in SAMPLES}
+timepoints = sorted({tp for tp in basename_to_timepoint.values() if tp is not None})
+
+HAS_EXPLICIT_TIMEPOINTS = len(timepoints) > 0
+if not HAS_EXPLICIT_TIMEPOINTS:
+    timepoints = [0]
+    print("No timepoints found in tile names; assuming all tiles belong to timepoint 0000")
+else:
+    print("Found timepoints:", timepoints)
+
+
+# ── Rules ──────────────────────────────────────────────────────────────────
+
+rule all:
+    input:
+        expand(
+            os.path.join(OUTPUT_DIR_RECONSTRUCTED, "restored_timepoint_{timepoint:04d}_segmented.tif"),
+            timepoint=timepoints,
+        )
+
+
+rule segment_tile:
+    """GPU: seeded omnipose 3D on a raw tile + paired seed mask; flows saved as float16."""
+    input:
+        raw   = lambda wildcards: file_path_map[wildcards.sample],
+        masks = lambda wildcards: os.path.join(SEEDS_DIR, wildcards.sample + "_masks.tif"),
+    output:
+        dp       = temp(os.path.join(OUTPUT_DIR, "{sample}_dP_seeded.tif")),
+        cellprob = temp(os.path.join(OUTPUT_DIR, "{sample}_cellprob_seeded.tif")),
+    resources:
+        mem_mb          = 16000,
+        runtime         = 60,
+        cpus            = 1,
+        slurm_partition = "short",
+        slurm_extra     = "--exclude=compg009,compg010,compg011,compg013",
+    log:
+        "slogs/omni_seeded_from_tiles/segment_{sample}.log"
+    shell:
+        """
+        export TMPDIR=/well/kir-fritzsche/users/aif490/tmp
+        mkdir -p $TMPDIR
+
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/omnipose_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/tiled_segmentation_omnipose_3d_seeded.py \
+            --raw            {input.raw} \
+            --masks          {input.masks} \
+            --output_dir     {OUTPUT_DIR} \
+            --model          {MODEL_PATH} \
+            --tile_size      {TILE_SIZE[0]} {TILE_SIZE[1]} {TILE_SIZE[2]} \
+            --overlap        {OVERLAP} \
+            --mask_threshold {MASK_THRESHOLD} \
+            --flow_threshold {FLOW_THRESHOLD} \
+            --min_size       {MIN_SIZE} \
+            --save_flows \
+            --verbose \
+            &> {log}
+        """
+
+
+rule reconstruct_from_tiles:
+    """High-memory CPU: stitch per-tile seeded flows and decode full-volume masks."""
+    input:
+        dp = lambda wildcards: [
+            os.path.join(OUTPUT_DIR, f"{b}_dP_seeded.tif")
+            for b in SAMPLES
+            if (basename_to_timepoint[b] == int(wildcards.timepoint)) or (not HAS_EXPLICIT_TIMEPOINTS)
+        ],
+        cellprob = lambda wildcards: [
+            os.path.join(OUTPUT_DIR, f"{b}_cellprob_seeded.tif")
+            for b in SAMPLES
+            if (basename_to_timepoint[b] == int(wildcards.timepoint)) or (not HAS_EXPLICIT_TIMEPOINTS)
+        ],
+    output:
+        os.path.join(OUTPUT_DIR_RECONSTRUCTED, "restored_timepoint_{timepoint,\d{4}}_segmented.tif"),
+    params:
+        timepoint = lambda wildcards: int(wildcards.timepoint),
+    resources:
+        mem_mb          = 150000,
+        runtime         = 300,
+        cpus            = 1,
+        slurm_partition = "short",
+        slurm_extra     = "--exclude=compg009,compg010,compg011,compg013",
+    log:
+        "slogs/omni_seeded_from_tiles/reconstruct_{timepoint}.log"
+    shell:
+        """
+        export TMPDIR=/well/kir-fritzsche/users/aif490/tmp
+        mkdir -p $TMPDIR
+
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/omnipose_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/batch_tile_reconstruction.py \
+            --tile_dir           {OUTPUT_DIR} \
+            --output_dir         {OUTPUT_DIR_RECONSTRUCTED} \
+            --timepoint          {params.timepoint} \
+            --overlap            {OVERLAP} \
+            --min_size           {MIN_SIZE} \
+            --cellprob_threshold {MASK_THRESHOLD} \
+            --omni \
+            --verbose &> {log}
+        """

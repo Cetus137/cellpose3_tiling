@@ -5,10 +5,9 @@
 module load snakemake/8.4.2-foss-2023a
 
 snakemake \
-    --snakefile Snakefile_segment \
+    --snakefile Snakefile_segment_cp4 \
     --executor slurm \
     --jobs 1200 \
-    --default-resources slurm_partition=short slurm_account=kir.prj \
+    --default-resources slurm_partition=short slurm_account=kir.prj mem_mb=0 \
     --latency-wait 60 \
-    --restart-times 1 \
     "$@"

@@ -1,9 +1,18 @@
 """
-File-based 3D omnipose training.
+File-based 3D omnipose training with 2-channel seeded input.
 
-When _flows3d.npy files are present alongside training tiles, loads precomputed
-lbl tensors and takes random crops — no per-batch flow computation.
-Falls back to on-the-fly flow computation if precomputed files are absent.
+Input data layout (per sample):
+  <sample>_composite.tif        — shape (2, Z, Y, X), dtype uint16/float
+                                   ch0 = raw intensity
+                                   ch1 = nuclear seed masks (instance labels)
+  <sample>_composite_masks.tif  — shape (Z, Y, X), whole-cell segmentation masks
+  <sample>_composite_flows3d.npy — precomputed omnipose label tensor
+                                   (generate with precompute_flows_3d.py
+                                    pointed at the same train_dir)
+
+Channel normalisation:
+  ch0 (raw)    — omnipose.utils.normalize99
+  ch1 (seeds)  — binarised to {0, 1}  (presence/absence of nuclear signal)
 """
 import glob, os, datetime, argparse, random
 import numpy as np
@@ -17,15 +26,33 @@ import omnipose.utils
 
 io.logger_setup()
 
+NCHAN = 2
 
-class FileTrainSet(train_set):
+
+def _load_composite(path):
+    """Load a (2, Z, Y, X) composite tif and return a normalised (2, Z, Y, X) float32 array."""
+    raw = tiff.imread(path).astype(np.float32)
+
+    if raw.ndim == 4 and raw.shape[0] == NCHAN:
+        img = np.empty_like(raw)
+        img[0] = omnipose.utils.normalize99(raw[0])
+        img[1] = (raw[1] > 0).astype(np.float32)   # binarise nuclear seeds
+    elif raw.ndim == 3:
+        # single-channel file accidentally passed — promote and leave ch1 as zeros
+        img = np.zeros((NCHAN,) + raw.shape, dtype=np.float32)
+        img[0] = omnipose.utils.normalize99(raw)
+    else:
+        raise ValueError(f"Unexpected composite shape {raw.shape} in {path}")
+
+    return img
+
+
+class SeededTrainSet(train_set):
     """
-    Subclass of omnipose.data.train_set that streams tiles from disk.
+    FileTrainSet for 2-channel seeded omnipose training.
 
-    If flows_files is provided (list of _flows3d.npy paths), uses the fast
-    precomputed path: load img + lbl, random crop, return immediately.
-    Otherwise falls back to on-the-fly flow computation via random_crop_warp
-    + masks_to_flows_batch (slow for large 3D tiles).
+    Expects composites (*_composite.tif) and paired masks (*_composite_masks.tif).
+    If precomputed *_composite_flows3d.npy files exist, uses the fast path.
     """
 
     def __init__(self, img_files, mask_files, flows_files=None, **kwargs):
@@ -44,16 +71,12 @@ class FileTrainSet(train_set):
 
     def _getitem_precomputed(self, inds):
         nimg = len(inds)
-        imgi = np.zeros((nimg, self.nchan) + self.tyx, np.float32)
+        imgi = np.zeros((nimg, NCHAN) + self.tyx, np.float32)
         lbl_list = []
 
         for i, idx in enumerate(inds):
-            img      = omnipose.utils.normalize99(
-                np.squeeze(tiff.imread(self.img_files[idx])).astype(np.float32))
-            lbl_full = np.load(self.flows_files[idx]).astype(np.float32)  # (nchannels, Z, Y, X)
-
-            if img.ndim == self.dim:
-                img = img[np.newaxis]  # (1, Z, Y, X)
+            img      = _load_composite(self.img_files[idx])           # (2, Z, Y, X)
+            lbl_full = np.load(self.flows_files[idx]).astype(np.float32)
 
             starts = [
                 np.random.randint(0, max(1, img.shape[d + 1] - self.tyx[d]))
@@ -67,23 +90,19 @@ class FileTrainSet(train_set):
 
     def _getitem_live(self, inds):
         nimg   = len(inds)
-        imgi   = np.zeros((nimg, self.nchan) + self.tyx, np.float32)
+        imgi   = np.zeros((nimg, NCHAN) + self.tyx, np.float32)
         labels = np.zeros((nimg,) + self.tyx, np.float32)
         links  = [None] * nimg
 
         for i, idx in enumerate(inds):
-            img  = omnipose.utils.normalize99(
-                np.squeeze(tiff.imread(self.img_files[idx])).astype(np.float32))
+            img  = _load_composite(self.img_files[idx])               # (2, Z, Y, X)
             mask = np.squeeze(tiff.imread(self.mask_files[idx]))
             mask = omnipose.utils.format_labels(mask)
-
-            if img.ndim == self.dim:
-                img = img[np.newaxis]
 
             imgi[i], labels[i], _ = random_crop_warp(
                 img=img, Y=mask,
                 tyx=self.tyx, v1=self.v1, v2=self.v2,
-                nchan=self.nchan, rescale=self.rescale[idx],
+                nchan=NCHAN, rescale=self.rescale[idx],
                 scale_range=self.scale_range,
                 gamma_range=self.gamma_range,
                 do_flip=self.do_flip, ind=idx,
@@ -92,7 +111,7 @@ class FileTrainSet(train_set):
         out = masks_to_flows_batch(
             labels, links,
             device=self.device,
-            omni=self.omni, dim=self.dim,
+            omni=True, dim=self.dim,
             affinity_field=self.affinity_field,
         )[:-2]
 
@@ -103,7 +122,7 @@ class FileTrainSet(train_set):
         ]
         lbl = batch_labels(
             masks, bd, T, mu, self.tyx,
-            dim=self.dim, nclasses=self.nclasses,
+            dim=self.dim, nclasses=3,
             device=torch.device('cpu'),
         )
         return torch.tensor(imgi), lbl, inds
@@ -121,16 +140,15 @@ def _build_lr_schedule(learning_rate, n_epochs):
 
 
 def _net_state_dict(model):
-    """Save net weights without the 'module.' prefix that cellpose_omni adds."""
     sd = model.net.state_dict()
     if any(k.startswith('module.') for k in sd):
         sd = {k[len('module.'):]: v for k, v in sd.items()}
     return sd
 
 
-def train_omnipose_3d(
+def train_omnipose_seeded(
     train_dir,
-    model_name='omnipose_3d',
+    model_name='omnipose_3d_seeded',
     n_epochs=4000,
     batch_size=1,
     learning_rate=0.005,
@@ -142,105 +160,94 @@ def train_omnipose_3d(
     save_dir = os.path.join(train_dir, 'models')
     os.makedirs(save_dir, exist_ok=True)
 
-    all_mask_files = sorted(glob.glob(os.path.join(train_dir, '*_masks.tif')))
+    all_mask_files = sorted(glob.glob(os.path.join(train_dir, '*_composite_masks.tif')))
     img_files, mask_files, flows_files = [], [], []
     for mf in all_mask_files:
         mask = tiff.imread(mf)
         if np.count_nonzero(mask) / mask.size < 0.01:
             continue
-        imf = mf.replace('_masks.tif', '.tif')
+        imf = mf.replace('_composite_masks.tif', '_composite.tif')
         if not os.path.exists(imf):
             continue
         img_files.append(imf)
         mask_files.append(mf)
-        flows_files.append(imf.replace('.tif', '_flows3d.npy'))
+        flows_files.append(imf.replace('_composite.tif', '_composite_flows3d.npy'))
+
+    if not img_files:
+        raise RuntimeError(
+            f"No paired *_composite.tif / *_composite_masks.tif found in {train_dir}"
+        )
 
     ready = [os.path.exists(f) for f in flows_files]
     n_precomputed = sum(ready)
     if n_precomputed == 0:
-        raise RuntimeError(
-            "No precomputed _flows3d.npy files found. "
-            "Submit precompute_flows_3d.sl first."
-        )
-    if n_precomputed < len(img_files):
-        img_files   = [f for f, r in zip(img_files,   ready) if r]
-        mask_files  = [f for f, r in zip(mask_files,  ready) if r]
-        flows_files = [f for f, r in zip(flows_files, ready) if r]
-        print(f"Training on {n_precomputed} tiles with precomputed flows "
-              f"({len(ready) - n_precomputed} tiles still pending precompute)")
+        print("No precomputed flows found — using on-the-fly computation (slow).")
+        flows_files_arg = None
     else:
-        print(f"Training on {len(img_files)} tiles with precomputed flows (fast path)")
+        if n_precomputed < len(img_files):
+            img_files   = [f for f, r in zip(img_files,   ready) if r]
+            mask_files  = [f for f, r in zip(mask_files,  ready) if r]
+            flows_files = [f for f, r in zip(flows_files, ready) if r]
+            print(f"Training on {n_precomputed}/{len(ready)} tiles with precomputed flows")
+        else:
+            print(f"Training on {len(img_files)} tiles with precomputed flows (fast path)")
+        flows_files_arg = flows_files
 
-    # 10% held-out test split
     rng = random.Random(42)
     indices = list(range(len(img_files)))
     rng.shuffle(indices)
     n_test = max(1, int(0.1 * len(indices)))
     test_idx, train_idx = indices[:n_test], indices[n_test:]
-    test_img_files   = [img_files[i]   for i in test_idx]
-    test_mask_files  = [mask_files[i]  for i in test_idx]
-    test_flows_files = [flows_files[i] for i in test_idx]
-    img_files   = [img_files[i]   for i in train_idx]
-    mask_files  = [mask_files[i]  for i in train_idx]
-    flows_files = [flows_files[i] for i in train_idx]
-    print(f"  train: {len(img_files)}  test: {len(test_img_files)}")
+
+    def _split(lst): return [lst[i] for i in test_idx], [lst[i] for i in train_idx]
+
+    test_img,   img_files   = _split(img_files)
+    test_mask,  mask_files  = _split(mask_files)
+    test_flows, flows_files = _split(flows_files) if flows_files_arg else (None, None)
+    print(f"  train: {len(img_files)}  test: {len(test_img)}")
 
     model = models.CellposeModel(
         gpu=True, pretrained_model=False,
-        nchan=1, nclasses=3, dim=3, omni=True,
+        nchan=NCHAN, nclasses=3, dim=3, omni=True,
     )
 
     tyx = (128,) * 3
-
-    dataset = FileTrainSet(
-        img_files, mask_files,
-        flows_files=flows_files,
+    dataset_kwargs = dict(
         rescale=False, diam_train=None, tyx=tyx,
-        scale_range=1.0, omni=True, dim=3, nchan=1, nclasses=3,
-        device=model.device,
-        affinity_field=False,
+        scale_range=1.0, omni=True, dim=3, nchan=NCHAN, nclasses=3,
+        device=model.device, affinity_field=False,
     )
 
-    sampler = torch.utils.data.sampler.BatchSampler(
-        torch.utils.data.sampler.RandomSampler(dataset),
-        batch_size=batch_size, drop_last=False,
+    dataset = SeededTrainSet(
+        img_files, mask_files, flows_files=flows_files, **dataset_kwargs
     )
-    loader = torch.utils.data.DataLoader(
-        dataset, batch_size=1, shuffle=False,
-        sampler=sampler,
-        collate_fn=dataset.collate_fn,
-        worker_init_fn=dataset.worker_init_fn,
-        num_workers=num_workers, pin_memory=True,
+    test_dataset = SeededTrainSet(
+        test_img, test_mask, flows_files=test_flows, **dataset_kwargs
     )
 
-    test_dataset = FileTrainSet(
-        test_img_files, test_mask_files,
-        flows_files=test_flows_files,
-        rescale=False, diam_train=None, tyx=tyx,
-        scale_range=1.0, omni=True, dim=3, nchan=1, nclasses=3,
-        device=model.device,
-        affinity_field=False,
-    )
-    test_sampler = torch.utils.data.sampler.BatchSampler(
-        torch.utils.data.sampler.SequentialSampler(test_dataset),
-        batch_size=batch_size, drop_last=False,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=1, shuffle=False,
-        sampler=test_sampler,
-        collate_fn=test_dataset.collate_fn,
-        worker_init_fn=test_dataset.worker_init_fn,
-        num_workers=num_workers, pin_memory=True,
-    )
+    def _make_loader(ds, shuffle):
+        sampler = torch.utils.data.sampler.BatchSampler(
+            torch.utils.data.sampler.RandomSampler(ds) if shuffle
+            else torch.utils.data.sampler.SequentialSampler(ds),
+            batch_size=batch_size, drop_last=False,
+        )
+        return torch.utils.data.DataLoader(
+            ds, batch_size=1, shuffle=False, sampler=sampler,
+            collate_fn=ds.collate_fn, worker_init_fn=ds.worker_init_fn,
+            num_workers=num_workers, pin_memory=True,
+        )
+
+    loader      = _make_loader(dataset,      shuffle=True)
+    test_loader = _make_loader(test_dataset, shuffle=False)
 
     LR = _build_lr_schedule(learning_rate, n_epochs)
     model.net.mkldnn = False
-    model.autocast = False
+    model.autocast   = False
     model._set_optimizer(LR[0], momentum, weight_decay, SGD=True)
     model._set_criterion()
 
     print(f"Starting: {n_epochs} epochs, batch_size={batch_size}, "
-          f"lr={learning_rate}, crop={tyx}, device={model.device}")
+          f"lr={learning_rate}, crop={tyx}, nchan={NCHAN}, device={model.device}")
 
     for iepoch in range(n_epochs):
         model._set_learning_rate(LR[iepoch])
@@ -279,19 +286,18 @@ def train_omnipose_3d(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='File-based 3D omnipose training')
-    parser.add_argument('--train_dir', type=str,
-                        default='/users/kir-fritzsche/aif490/devel/tissue_analysis/'
-                                'segmentation_scripts/for_training/ph3/training_raw')
-    parser.add_argument('--model_name',     type=str,   default='omnipose_3d_ph3')
-    parser.add_argument('--n_epochs',       type=int,   default=4000)
-    parser.add_argument('--batch_size',     type=int,   default=1)
-    parser.add_argument('--learning_rate',  type=float, default=0.005)
-    parser.add_argument('--save_every',     type=int,   default=10)
-    parser.add_argument('--num_workers',    type=int,   default=4)
+        description='3D omnipose training with 2-channel nuclear-seeded input')
+    parser.add_argument('--train_dir',     type=str, required=True,
+                        help='Directory containing *_composite.tif and *_composite_masks.tif')
+    parser.add_argument('--model_name',    type=str,   default='omnipose_3d_seeded')
+    parser.add_argument('--n_epochs',      type=int,   default=4000)
+    parser.add_argument('--batch_size',    type=int,   default=1)
+    parser.add_argument('--learning_rate', type=float, default=0.005)
+    parser.add_argument('--save_every',    type=int,   default=10)
+    parser.add_argument('--num_workers',   type=int,   default=4)
     args = parser.parse_args()
 
-    train_omnipose_3d(
+    train_omnipose_seeded(
         train_dir=args.train_dir,
         model_name=args.model_name,
         n_epochs=args.n_epochs,

@@ -1,13 +1,13 @@
 #!/bin/bash
-# Wrapper script for Snakemake segmentation workflow
+# Run the affinity segmentation Snakemake workflow.
+# Submit from: SLURM/
 
-# Load Snakemake module
 module load snakemake/8.4.2-foss-2023a
 
 snakemake \
-    --snakefile Snakefile_segment \
+    --snakefile Snakefile_segment_affinity \
     --executor slurm \
-    --jobs 1200 \
+    --jobs 2000 \
     --default-resources slurm_partition=short slurm_account=kir.prj \
     --latency-wait 60 \
     --restart-times 1 \

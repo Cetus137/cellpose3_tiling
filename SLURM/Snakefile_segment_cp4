@@ -1,0 +1,116 @@
+# Snakefile for segmentation workflow
+# Segment all .tif files in INPUT_DIR and save results as <name>_masks.tif
+# Two-stage pipeline:
+#   1. compute_flows  — GPU: run cpSAM encoder, save dP_blur + cellprob_blur (temp)
+#   2. compute_masks  — CPU: load flows, run compute_masks, write final _masks.tif
+
+import os
+from pathlib import Path
+import glob
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+INPUT_DIR        = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/lifeact"
+OUTPUT_DIR       = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/lifeact_seg_cp4"
+OUTPUT_DIR_FLOWS = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/lifeact_seg_cp4/flows"
+MODEL_PATH       = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/SLURM/models/cpsam_ph3"
+SCRIPT_DIR       = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+
+# Segmentation parameters
+CELLPROB_THRESHOLD = -4.0
+FLOW_THRESHOLD     = 0.4
+MIN_SIZE           = 2500
+
+# ──────────────────────────────────────────────────────────────────────────────
+# File discovery
+# ──────────────────────────────────────────────────────────────────────────────
+
+_EXCLUDE_SUFFIXES = ("_masks.tif", "_segmented.tif", "_dP_blur.tif", "_cellprob_blur.tif")
+input_files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.tif")))
+input_files = [f for f in input_files if not any(f.endswith(s) for s in _EXCLUDE_SUFFIXES)]
+SAMPLES = [Path(f).stem for f in input_files]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rules
+# ──────────────────────────────────────────────────────────────────────────────
+
+rule all:
+    input:
+        expand(os.path.join(OUTPUT_DIR, "{sample}_masks.tif"), sample=SAMPLES)
+
+
+rule compute_flows:
+    """GPU: run cpSAM encoder on each tile, save dP_blur + cellprob_blur."""
+    input:
+        os.path.join(INPUT_DIR, "{sample}.tif"),
+    output:
+        dp       = os.path.join(OUTPUT_DIR_FLOWS, "{sample}_dP_blur.tif"),
+        cellprob = os.path.join(OUTPUT_DIR_FLOWS, "{sample}_cellprob_blur.tif"),
+    resources:
+        runtime         = 20,
+        cpus            = 1,
+        slurm_partition = "gpu_rtx8000_48gb,gpu_v100_32gb,gpu_v100_16gb,gpu_a100_80gb,gpu_a100_40gb",
+        slurm_extra     = "--account gpu_kir.prj --mem-per-gpu=8000 --gres=gpu:1 --exclude=compg009,compg010,compg011,compg013",
+    log:
+        "slogs/segmentation_cpSAM/flows_{sample}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        module load CUDA/12.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose4_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/batch_tile_segmentation_3views.py \
+            --input_file         {input} \
+            --output_dir         {OUTPUT_DIR_FLOWS} \
+            --model              {MODEL_PATH} \
+            --cellprob_threshold {CELLPROB_THRESHOLD} \
+            --min_size           {MIN_SIZE} \
+            --gpu \
+            --verbose &> {log}
+        """
+
+
+rule compute_masks:
+    """CPU: load flows, run compute_masks, write final instance masks."""
+    input:
+        dp       = os.path.join(OUTPUT_DIR_FLOWS, "{sample}_dP_blur.tif"),
+        cellprob = os.path.join(OUTPUT_DIR_FLOWS, "{sample}_cellprob_blur.tif"),
+    output:
+        os.path.join(OUTPUT_DIR, "{sample}_masks.tif"),
+    resources:
+        runtime         = 30,
+        cpus            = 4,
+        slurm_partition = "short",
+        slurm_extra     = "--mem=32G",
+    log:
+        "slogs/segmentation_cpSAM/masks_{sample}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose4_env/bin/activate
+
+        python3 -u - <<'PYEOF' &> {log}
+import tifffile as tiff
+import numpy as np
+from cellpose.dynamics import compute_masks
+
+dP       = tiff.imread("{input.dp}").astype(np.float32)
+cellprob = tiff.imread("{input.cellprob}").astype(np.float32)
+
+masks = compute_masks(
+    dP, cellprob,
+    flow_threshold={FLOW_THRESHOLD},
+    cellprob_threshold={CELLPROB_THRESHOLD},
+    min_size={MIN_SIZE},
+    do_3D=True,
+)
+tiff.imwrite("{output}", masks.astype(np.uint16))
+print(f"Saved {{masks.max()}} objects to {{'{output}'}}")
+PYEOF
+        """

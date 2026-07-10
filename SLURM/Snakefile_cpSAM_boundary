@@ -1,0 +1,190 @@
+# Snakefile_cpSAM_boundary
+# ========================
+# Two-stage pipeline:
+#   1. make_composite  — combine raw .tif + nuclear-seed _masks.tif
+#                        into a 2-channel composite (Ch0=raw, Ch1=seeds)
+#   2. segment_cpSAM   — run Cellpose 4 / cpSAM on the composite and
+#                        save whole-cell instance masks as *_boundary_masks.tif
+#
+# Required directory layout:
+#   INPUT_DIR/
+#       sample.tif          ← raw intensity volume
+#       sample_masks.tif    ← nuclear-seed masks (paired with sample.tif)
+#
+# Outputs:
+#   OUTPUT_DIR_COMPOSITE/sample_composite.tif
+#   OUTPUT_DIR_MASKS/sample_boundary_masks.tif
+
+import os
+from pathlib import Path
+import glob
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration — update these paths before running
+# ──────────────────────────────────────────────────────────────────────────────
+
+INPUT_DIR            = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/training_raw"
+OUTPUT_DIR_COMPOSITE = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/training_seeded/composites"
+OUTPUT_DIR_FLOWS     = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/ph_boundary_cpSAM/flows"
+OUTPUT_DIR_MASKS     = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/tiles/ph_boundary_cpSAM/boundary_masks"
+MODEL_PATH           = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/models/cpsam_boundary_from_composites"
+SCRIPT_DIR           = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+
+# Set to True to skip make_composite and use existing composites in OUTPUT_DIR_COMPOSITE
+SKIP_MAKE_COMPOSITE  = False
+
+# cpSAM segmentation parameters
+CHANNELS           = [1, 2]   # ch1=cytoplasm (raw), ch2=nuclei (seeds)
+DIAMETER           = None     # set to a float (e.g. 30.0) to fix cell diameter
+CELLPROB_THRESHOLD = 0.0
+FLOW_THRESHOLD     = 0.4
+MIN_SIZE           = 5000
+
+# ──────────────────────────────────────────────────────────────────────────────
+# File discovery — find raw .tif files that have a paired _masks.tif
+# ──────────────────────────────────────────────────────────────────────────────
+
+_EXCLUDE_SUFFIXES = ("_masks.tif", "_composite.tif", "_boundary_masks.tif", "_segmented.tif")
+
+_all_tifs = sorted(glob.glob(os.path.join(INPUT_DIR, "*.tif")))
+_raw_tifs = [f for f in _all_tifs if not any(f.endswith(s) for s in _EXCLUDE_SUFFIXES)]
+
+SAMPLES = []
+for _f in _raw_tifs:
+    _stem = Path(_f).stem
+    _masks_path = os.path.join(INPUT_DIR, _stem + "_masks.tif")
+    if os.path.exists(_masks_path):
+        SAMPLES.append(_stem)
+    else:
+        print(f"WARNING: no paired _masks.tif found for {_f} — skipping")
+
+if not SAMPLES:
+    # Fall back to existing composites (e.g. when running with --allowed-rules segment_cpSAM)
+    _existing = sorted(glob.glob(os.path.join(OUTPUT_DIR_COMPOSITE, "*_composite.tif")))
+    SAMPLES = [Path(f).stem.replace("_composite", "") for f in _existing]
+    if not SAMPLES:
+        raise ValueError(
+            f"No paired (raw + _masks.tif) files found in {INPUT_DIR} and "
+            f"no existing composites in {OUTPUT_DIR_COMPOSITE}."
+        )
+    print(f"No raw+mask pairs found; using {len(SAMPLES)} existing composite(s)")
+else:
+    print(f"Found {len(SAMPLES)} paired sample(s): {SAMPLES}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rules
+# ──────────────────────────────────────────────────────────────────────────────
+
+rule all:
+    input:
+        expand(
+            os.path.join(OUTPUT_DIR_MASKS, "{sample}_composite_boundary_masks.tif"),
+            sample=SAMPLES,
+        )
+
+
+rule make_composite:
+    """CPU: combine raw + nuclear-seed masks into a 2-channel composite."""
+    input:
+        raw   = os.path.join(INPUT_DIR, "{sample}.tif"),
+        masks = os.path.join(INPUT_DIR, "{sample}_masks.tif"),
+    output:
+        os.path.join(OUTPUT_DIR_COMPOSITE, "{sample}_composite.tif"),
+    resources:
+        runtime         = 10,
+        cpus            = 1,
+        slurm_partition = "short",
+        slurm_extra     = "--mem=8G",
+    log:
+        "slogs/make_composite/make_composite_{sample}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose3_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/make_composite.py \
+            --raw    {input.raw} \
+            --masks  {input.masks} \
+            --output {output} \
+            --verbose &> {log}
+        """
+
+
+rule compute_flows:
+    """GPU: run cpSAM encoder on each composite, save dP_blur + cellprob_blur."""
+    input:
+        os.path.join(OUTPUT_DIR_COMPOSITE, "{sample}_composite.tif"),
+    output:
+        dp       = os.path.join(OUTPUT_DIR_FLOWS, "{sample}_composite_dP_blur.tif"),
+        cellprob = os.path.join(OUTPUT_DIR_FLOWS, "{sample}_composite_cellprob_blur.tif"),
+    resources:
+        runtime         = 20,
+        cpus            = 1,
+        slurm_partition = "gpu_rtx8000_48gb,gpu_v100_32gb,gpu_v100_16gb,gpu_a100_80gb,gpu_a100_40gb",
+        slurm_extra     = "--account gpu_kir.prj --mem-per-gpu=8000 --gres=gpu:1 --exclude=compg009,compg010,compg011,compg013",
+    log:
+        "slogs/boundary/flows_{sample}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        module load CUDA/12.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose4_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/batch_tile_segmentation_3views.py \
+            --input_file         {input} \
+            --output_dir         {OUTPUT_DIR_FLOWS} \
+            --model              {MODEL_PATH} \
+            --channels           {CHANNELS[0]} {CHANNELS[1]} \
+            --cellprob_threshold {CELLPROB_THRESHOLD} \
+            --min_size           {MIN_SIZE} \
+            --gpu \
+            --verbose &> {log}
+        """
+
+
+rule compute_masks:
+    """CPU: load flows, run compute_masks, write final boundary mask."""
+    input:
+        dp       = os.path.join(OUTPUT_DIR_FLOWS, "{sample}_composite_dP_blur.tif"),
+        cellprob = os.path.join(OUTPUT_DIR_FLOWS, "{sample}_composite_cellprob_blur.tif"),
+    output:
+        os.path.join(OUTPUT_DIR_MASKS, "{sample}_composite_boundary_masks.tif"),
+    params:
+        diameter_flag = ("--diameter " + str(DIAMETER)) if DIAMETER is not None else "",
+    resources:
+        runtime         = 30,
+        cpus            = 4,
+        slurm_partition = "short",
+        slurm_extra     = "--mem=32G",
+    log:
+        "slogs/boundary/masks_{sample}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/cellpose4_env/bin/activate
+
+        python3 -u - <<'PYEOF' &> {log}
+import tifffile as tiff
+import numpy as np
+from cellpose.dynamics import compute_masks
+
+dP       = tiff.imread("{input.dp}").astype(np.float32)
+cellprob = tiff.imread("{input.cellprob}").astype(np.float32)
+
+masks = compute_masks(
+    dP, cellprob,
+    flow_threshold={FLOW_THRESHOLD},
+    cellprob_threshold={CELLPROB_THRESHOLD},
+    min_size={MIN_SIZE},
+    do_3D=True,
+)
+tiff.imwrite("{output}", masks.astype(np.uint16))
+print(f"Saved {{masks.max()}} objects to {{'{output}'}}")
+PYEOF
+        """

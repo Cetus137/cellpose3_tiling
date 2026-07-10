@@ -1,0 +1,70 @@
+# Snakefile for native 3D omnipose segmentation
+# Input:  single-channel 3D tifs (Z, Y, X) — same format as training tiles.
+# Output: {OUTPUT_DIR}/{sample}_masks.tif
+
+import os
+from pathlib import Path
+import glob
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+INPUT_DIR  = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles_restored"
+OUTPUT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/lymphnode_analysis/data2track/b2-6a_overview_pos1-01_deskew_cgt/crop1/tiles_restored_omni_segmented"
+MODEL_PATH = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts/for_training/ph3/training_raw/models/omnipose_3d_ph3_norm_ep0060"
+SCRIPT_DIR = "/users/kir-fritzsche/aif490/devel/tissue_analysis/segmentation_scripts"
+
+# ── Inference parameters ───────────────────────────────────────────────────
+TILE_SIZE       = [128, 128, 128]  # matches training crop size
+OVERLAP         = 16
+GAMMA           = 1.0
+MASK_THRESHOLD  = 0.0
+FLOW_THRESHOLD  = 0.4
+MIN_SIZE        = 5000
+
+# ── Discover inputs ────────────────────────────────────────────────────────
+input_files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.tif")))
+input_files = [f for f in input_files
+               if "_masks" not in f and "_flows" not in f]
+SAMPLES = [Path(f).stem for f in input_files]
+
+print(f"Found {len(SAMPLES)} tiles  |  model: {Path(MODEL_PATH).name}")
+
+
+rule all:
+    input:
+        expand(os.path.join(OUTPUT_DIR, "{sample}_masks.tif"), sample=SAMPLES)
+
+
+rule segment:
+    input:
+        os.path.join(INPUT_DIR, "{sample}.tif")
+    output:
+        os.path.join(OUTPUT_DIR, "{sample}_masks.tif")
+    resources:
+        mem_mb = 8000,
+        runtime = 35,
+        cpus = 1,
+        slurm_partition = "short",
+        slurm_extra = " --exclude=compg009,compg010,compg011,compg013"
+    log:
+        "slogs/omni/segment_{sample}.log"
+    shell:
+        """
+        module purge
+        source /well/kir/config/modules.sh
+        module load Python/3.10.8-GCCcore-12.2.0
+        module load CUDA/12.0
+        source ~/devel/venv/Python-3.10.8-GCCcore-12.2.0/omnipose_env/bin/activate
+
+        python3 -u {SCRIPT_DIR}/tiled_segmentation_omnipose_3d.py \
+            --input_file    {input} \
+            --output_dir    {OUTPUT_DIR} \
+            --model         {MODEL_PATH} \
+            --tile_size     {TILE_SIZE[0]} {TILE_SIZE[1]} {TILE_SIZE[2]} \
+            --overlap       {OVERLAP} \
+            --gamma         {GAMMA} \
+            --mask_threshold {MASK_THRESHOLD} \
+            --flow_threshold {FLOW_THRESHOLD} \
+            --min_size      {MIN_SIZE} \
+            --verbose \
+            &> {log}
+        """
